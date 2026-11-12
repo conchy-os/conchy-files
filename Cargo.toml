@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 gpui = "0.2.2"
+libc = "0.2"
 rayon = "1.12.0"

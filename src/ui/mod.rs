@@ -1,5 +1,9 @@
 //! Окно conchy-files: дерево папок, типы файлов и treemap, связанные выделением.
 
+mod actions;
+mod dialogs;
+mod field;
+
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -11,9 +15,10 @@ use std::time::{Duration, Instant};
 use conchy_files::layout::{self, Cell, CellKind, HEADER_H};
 use conchy_files::model::{NodeId, Tree, human_size};
 use conchy_files::scan::{Progress, ScanOptions, scan};
+use conchy_files::ops::Mode;
 use conchy_files::treemap::Rect;
 use gpui::{
-    App, Bounds, ClickEvent, Context, ContentMask, FocusHandle, Hsla, KeyBinding, MouseButton,
+    App, Bounds, ClickEvent, Context, ContentMask, FocusHandle, Hsla, KeyBinding, Modifiers, MouseButton,
     MouseDownEvent, MouseMoveEvent, Pixels, ScrollStrategy, SharedString, Task, TextRun, Timer,
     UniformListScrollHandle, Window, actions, canvas, div, hsla, linear_color_stop, linear_gradient,
     point, prelude::*, px, quad, relative, rgb,
@@ -22,10 +27,15 @@ use gpui::{
 
 actions!(
     conchy_files,
-    [SelectNext, SelectPrev, Expand, Collapse, ZoomIn, ZoomOut, OpenItem, Rescan, Quit]
+    [
+        SelectNext, SelectPrev, Expand, Collapse, ZoomIn, ZoomOut, OpenItem, Rescan, Quit, CutFiles,
+        CopyFiles, PasteFiles, RenameItem, NewFolder, TrashFiles, DeleteFiles, Undo, CopyPath, Cancel
+    ]
 );
 
 const CTX: &str = "FilesView";
+/// Пока открыт диалог, привязки окна не срабатывают: клавиши идут в поле ввода.
+const CTX_DIALOG: &str = "FilesDialog";
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -43,6 +53,19 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f5", Rescan, Some(CTX)),
         KeyBinding::new("q", Quit, Some(CTX)),
         KeyBinding::new("ctrl-q", Quit, Some(CTX)),
+        // Клавиши Thunar.
+        KeyBinding::new("ctrl-x", CutFiles, Some(CTX)),
+        KeyBinding::new("ctrl-c", CopyFiles, Some(CTX)),
+        KeyBinding::new("ctrl-insert", CopyFiles, Some(CTX)),
+        KeyBinding::new("ctrl-v", PasteFiles, Some(CTX)),
+        KeyBinding::new("shift-insert", PasteFiles, Some(CTX)),
+        KeyBinding::new("f2", RenameItem, Some(CTX)),
+        KeyBinding::new("ctrl-shift-n", NewFolder, Some(CTX)),
+        KeyBinding::new("delete", TrashFiles, Some(CTX)),
+        KeyBinding::new("shift-delete", DeleteFiles, Some(CTX)),
+        KeyBinding::new("ctrl-z", Undo, Some(CTX)),
+        KeyBinding::new("ctrl-shift-c", CopyPath, Some(CTX)),
+        KeyBinding::new("escape", Cancel, Some(CTX)),
     ]);
 }
 
@@ -54,6 +77,8 @@ const TEXT: u32 = 0xc0caf5;
 const DIM: u32 = 0x737aa2;
 const ACCENT: u32 = 0x7aa2f7;
 const SEL_BG: u32 = 0x2e3c64;
+/// Отмеченные Ctrl/Shift+кликом строки (выделенная строка остаётся ярче).
+const MARK_BG: u32 = 0x283457;
 
 /// Свой цвет у каждого типа файлов, как в WizTree. Оттенки идут по золотому сечению,
 /// поэтому соседние по размеру типы всегда заметно различаются.
@@ -96,6 +121,18 @@ pub struct FilesView {
     hovered: Option<Cell>,
     /// Последняя раскладка карты (заполняется при отрисовке, читается мышью).
     cells: Rc<RefCell<MapCache>>,
+    /// Растёт при каждом изменении дерева, сбрасывает кеш раскладки.
+    tree_gen: usize,
+
+    /// Несколько элементов, отмеченных Ctrl/Shift+кликом. Пусто — работаем с выделенным.
+    marked: HashSet<NodeId>,
+    clipboard: Option<actions::Clip>,
+    undo: Vec<conchy_files::ops::Record>,
+    job: Option<actions::Job>,
+    dialog: Option<dialogs::Dialog>,
+    menu: Option<dialogs::Menu>,
+    /// Короткое сообщение справа в строке состояния.
+    notice: Option<(String, Instant)>,
 }
 
 #[derive(Default)]
@@ -122,6 +159,14 @@ impl FilesView {
             type_filter: None,
             hovered: None,
             cells: Rc::default(),
+            tree_gen: 0,
+            marked: HashSet::new(),
+            clipboard: None,
+            undo: Vec::new(),
+            job: None,
+            dialog: None,
+            menu: None,
+            notice: None,
         };
         this.start_scan(cx);
         this
@@ -183,25 +228,20 @@ impl FilesView {
         self.view_root = Tree::ROOT;
         self.selected = Tree::ROOT;
         self.type_filter = None;
-        self.hovered = None;
-        *self.cells.borrow_mut() = MapCache::default();
+        self.marked.clear();
+        self.invalidate_map();
         if let Some(p) = old_path {
-            if let Some(id) = self.find_by_path(&p) {
+            if let Some(id) = self.tree.as_ref().and_then(|t| t.find(&p)) {
                 self.reveal(id);
             }
         }
         self.rebuild_rows();
     }
 
-    fn find_by_path(&self, path: &std::path::Path) -> Option<NodeId> {
-        let tree = self.tree.as_ref()?;
-        let rel = path.strip_prefix(&*tree.node(Tree::ROOT).name).ok()?;
-        let mut cur = Tree::ROOT;
-        for comp in rel.components() {
-            let name = comp.as_os_str().to_string_lossy();
-            cur = *tree.node(cur).children.iter().find(|&&c| *tree.node(c).name == *name)?;
-        }
-        Some(cur)
+    fn invalidate_map(&mut self) {
+        self.tree_gen += 1;
+        self.hovered = None;
+        *self.cells.borrow_mut() = MapCache::default();
     }
 
     // ---------- дерево ----------
@@ -243,6 +283,7 @@ impl FilesView {
         let Some(ix) = self.selected_row() else { return };
         let next = (ix as isize + delta).clamp(0, self.rows.len() as isize - 1) as usize;
         self.selected = self.rows[next].0;
+        self.marked.clear();
         self.tree_scroll.scroll_to_item(next, ScrollStrategy::Top);
         cx.notify();
     }
@@ -280,6 +321,28 @@ impl FilesView {
         cx.notify();
     }
 
+    /// Клик по элементу в дереве или на карте с учётом Ctrl (добавить/убрать)
+    /// и Shift (диапазон строк дерева), как в Thunar.
+    fn click_select(&mut self, id: NodeId, m: Modifiers) {
+        if m.control {
+            if self.marked.is_empty() && self.selected != Tree::ROOT {
+                self.marked.insert(self.selected);
+            }
+            if !self.marked.remove(&id) {
+                self.marked.insert(id);
+            }
+        } else if m.shift {
+            let pos = |x: NodeId| self.rows.iter().position(|(r, _)| *r == x);
+            if let (Some(a), Some(b)) = (pos(self.selected), pos(id)) {
+                let (a, b) = (a.min(b), a.max(b));
+                self.marked = self.rows[a..=b].iter().map(|(r, _)| *r).filter(|&r| r != Tree::ROOT).collect();
+            }
+        } else {
+            self.marked.clear();
+        }
+        self.selected = id;
+    }
+
     fn toggle_row(&mut self, id: NodeId, cx: &mut Context<Self>) {
         if !self.expanded.remove(&id) {
             self.expanded.insert(id);
@@ -312,10 +375,19 @@ impl FilesView {
         }
     }
 
-    fn open_item(&mut self, _: &OpenItem, _: &mut Window, _: &mut Context<Self>) {
-        if let Some(tree) = &self.tree {
-            let _ = std::process::Command::new("xdg-open").arg(tree.path(self.selected)).spawn();
+    fn open_item(&mut self, _: &OpenItem, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_cmd(actions::Cmd::Open, cx);
+    }
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.take().is_none() {
+            if self.job.is_some() {
+                self.cancel_job();
+            } else {
+                self.marked.clear();
+            }
         }
+        cx.notify();
     }
 
     fn rescan(&mut self, _: &Rescan, _: &mut Window, cx: &mut Context<Self>) {
@@ -342,7 +414,18 @@ impl FilesView {
             self.zoom_to(id);
         }
         self.reveal(id);
+        self.click_select(id, ev.modifiers);
         cx.notify();
+    }
+
+    fn on_map_right_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(cell) = self.cell_at(ev.position) else { return };
+        let id = match cell.kind {
+            CellKind::Node(id) => id,
+            CellKind::Others { parent, .. } => parent,
+        };
+        self.reveal(id);
+        self.open_menu(id, ev.position, cx);
     }
 
     fn on_map_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -477,12 +560,19 @@ impl FilesView {
             self.rows.len(),
             cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
                 let Some(tree) = this.tree.clone() else { return Vec::new() };
+                let cut_paths: Option<HashSet<PathBuf>> = this
+                    .clipboard
+                    .as_ref()
+                    .filter(|c| c.mode == Mode::Move)
+                    .map(|c| c.paths.iter().cloned().collect());
                 range
                     .map(|ix| {
                         let (id, depth) = this.rows[ix];
                         let n = tree.node(id);
                         let share = tree.share_of_parent(id);
                         let selected = id == this.selected;
+                        let marked = this.marked.contains(&id);
+                        let cut = cut_paths.as_ref().is_some_and(|c| c.contains(&tree.path(id)));
                         let chevron = if !n.is_dir || n.children.is_empty() {
                             ""
                         } else if this.expanded.contains(&id) {
@@ -499,16 +589,22 @@ impl FilesView {
                             .px_2()
                             .cursor_pointer()
                             .when(selected, |d| d.bg(rgb(SEL_BG)))
-                            .when(!selected, |d| d.hover(|s| s.bg(rgb(BORDER))))
+                            .when(marked && !selected, |d| d.bg(rgb(MARK_BG)))
+                            .when(!selected && !marked, |d| d.hover(|s| s.bg(rgb(BORDER))))
                             .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                                if ev.click_count() >= 2 {
+                                let m = ev.modifiers();
+                                if ev.click_count() >= 2 && !m.control && !m.shift {
                                     this.zoom_to(id);
                                     this.toggle_row(id, cx);
                                 } else {
-                                    this.selected = id;
+                                    this.click_select(id, m);
                                     cx.notify();
                                 }
                             }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, ev: &MouseDownEvent, _, cx| this.open_menu(id, ev.position, cx)),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -545,6 +641,8 @@ impl FilesView {
                                             .whitespace_nowrap()
                                             .text_ellipsis()
                                             .when(!n.is_dir, |d| d.text_color(rgb(DIM)))
+                                            // Вырезанное показываем бледным, как Thunar.
+                                            .when(cut, |d| d.opacity(0.45))
                                             .child(n.name.to_string()),
                                     ),
                             )
@@ -662,6 +760,8 @@ impl FilesView {
         let cache = self.cells.clone();
         let view_root = self.view_root;
         let selected = self.selected;
+        let marked = self.marked.clone();
+        let generation = self.tree_gen;
         let filter = self.type_filter;
         let hovered_rect = self.hovered.as_ref().map(|c| c.rect);
 
@@ -674,7 +774,7 @@ impl FilesView {
                 let key = (
                     view_root,
                     [b.x as i32, b.y as i32, b.w as i32, b.h as i32],
-                    Arc::as_ptr(&tree) as usize,
+                    generation,
                 );
                 let mut cache = cache.borrow_mut();
                 if cache.key != Some(key) {
@@ -683,7 +783,7 @@ impl FilesView {
                 }
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     for cell in &cache.cells {
-                        paint_cell(&tree, cell, selected, filter, hovered_rect, window, cx);
+                        paint_cell(&tree, cell, selected, &marked, filter, hovered_rect, window, cx);
                     }
                 });
             },
@@ -697,12 +797,13 @@ impl FilesView {
             .border_t_1()
             .border_color(rgb(BORDER))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_map_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_map_right_down))
             .on_mouse_move(cx.listener(Self::on_map_mouse_move))
             .child(map)
     }
 
     /// Одна строка состояния снизу: что под курсором или что выделено.
-    fn render_status(&self) -> impl IntoElement {
+    fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let text: String = match &self.tree {
             None => String::new(),
             Some(tree) => {
@@ -727,15 +828,79 @@ impl FilesView {
                         count,
                         human_size(*size)
                     ),
+                    None if self.marked.len() > 1 => {
+                        let (size, files) = self.targets().iter().fold((0u64, 0u64), |(s, f), &id| {
+                            let n = tree.node(id);
+                            (s + n.size, f + n.files)
+                        });
+                        format!("Отмечено: {}  ·  {}  ·  {} файлов", self.marked.len(), human_size(size), files)
+                    }
                     None => describe(self.selected),
                 }
             }
         };
+
+        // Справа: идущая операция с прогрессом и отменой или короткое сообщение.
+        let right = if let Some(job) = &self.job {
+            let p = &job.progress;
+            let frac = p.fraction();
+            let current = p.current.lock().map(|c| conchy_files::ops::display_name(&c)).unwrap_or_default();
+            let secs = job.started.elapsed().as_secs_f32();
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .text_color(rgb(TEXT))
+                    .child(format!("{}… {:.0}%", job.title, frac * 100.0))
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(120.))
+                            .h(px(6.))
+                            .rounded_sm()
+                            .bg(rgb(BORDER))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .h_full()
+                                    .rounded_sm()
+                                    .bg(rgb(ACCENT))
+                                    .w(px(120. * frac)),
+                            ),
+                    )
+                    .child(div().max_w(px(220.)).overflow_hidden().text_ellipsis().text_color(rgb(DIM)).child(current))
+                    .child(div().text_color(rgb(DIM)).child(format!("{secs:.0} с")))
+                    .child(
+                        div()
+                            .id("cancel-job")
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BORDER)))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.cancel_job();
+                                cx.notify();
+                            }))
+                            .child("✕ Esc"),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            self.current_notice()
+                .map(|n| div().flex_shrink_0().text_color(rgb(ACCENT)).child(n.to_string()).into_any_element())
+        };
+
         div()
             .h(px(22.))
             .px_3()
             .flex()
             .items_center()
+            .justify_between()
+            .gap_4()
             .flex_shrink_0()
             .bg(rgb(PANEL))
             .border_t_1()
@@ -743,7 +908,8 @@ impl FilesView {
             .text_color(rgb(DIM))
             .overflow_hidden()
             .whitespace_nowrap()
-            .child(text)
+            .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
+            .children(right)
     }
 }
 
@@ -804,10 +970,12 @@ fn to_bounds(r: Rect) -> Bounds<Pixels> {
     Bounds { origin: point(px(r.x), px(r.y)), size: size(px(r.w), px(r.h)) }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_cell(
     tree: &Tree,
     cell: &Cell,
     selected: NodeId,
+    marked: &HashSet<NodeId>,
     filter: Option<u16>,
     hovered: Option<Rect>,
     window: &mut Window,
@@ -815,7 +983,7 @@ fn paint_cell(
 ) {
     let r = cell.rect;
     let is_hover = hovered == Some(r);
-    let is_selected = matches!(cell.kind, CellKind::Node(id) if id == selected);
+    let is_selected = matches!(cell.kind, CellKind::Node(id) if id == selected || marked.contains(&id));
     let outline: Hsla = hsla(0.0, 0.0, 0.0, 0.55);
 
     let (label, is_dir) = match cell.kind {
@@ -889,10 +1057,13 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 impl Render for FilesView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dialog = self.render_dialog(cx);
+        let menu = self.render_menu(window, cx);
         div()
-            .key_context(CTX)
+            .key_context(if self.dialog.is_some() { CTX_DIALOG } else { CTX })
             .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_dialog_key))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_prev))
             .on_action(cx.listener(Self::expand))
@@ -902,6 +1073,16 @@ impl Render for FilesView {
             .on_action(cx.listener(Self::open_item))
             .on_action(cx.listener(Self::rescan))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(|this, _: &CutFiles, _, cx| this.run_cmd(actions::Cmd::Cut, cx)))
+            .on_action(cx.listener(|this, _: &CopyFiles, _, cx| this.run_cmd(actions::Cmd::Copy, cx)))
+            .on_action(cx.listener(|this, _: &PasteFiles, _, cx| this.run_cmd(actions::Cmd::Paste, cx)))
+            .on_action(cx.listener(|this, _: &RenameItem, _, cx| this.run_cmd(actions::Cmd::Rename, cx)))
+            .on_action(cx.listener(|this, _: &NewFolder, _, cx| this.run_cmd(actions::Cmd::NewFolder, cx)))
+            .on_action(cx.listener(|this, _: &TrashFiles, _, cx| this.run_cmd(actions::Cmd::Trash, cx)))
+            .on_action(cx.listener(|this, _: &DeleteFiles, _, cx| this.run_cmd(actions::Cmd::Delete, cx)))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| this.run_cmd(actions::Cmd::Undo, cx)))
+            .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.run_cmd(actions::Cmd::CopyPath, cx)))
             .size_full()
             .flex()
             .flex_col()
@@ -918,6 +1099,8 @@ impl Render for FilesView {
                     .child(self.render_types(cx)),
             )
             .child(self.render_map(cx))
-            .child(self.render_status())
+            .child(self.render_status(cx))
+            .children(menu)
+            .children(dialog)
     }
 }

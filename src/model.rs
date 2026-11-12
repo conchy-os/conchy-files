@@ -6,7 +6,7 @@ use crate::scan::RawNode;
 
 pub type NodeId = u32;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
     pub name: Box<str>,
     pub parent: Option<NodeId>,
@@ -29,7 +29,7 @@ pub struct TypeStat {
     pub files: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Tree {
     pub nodes: Vec<Node>,
     /// Типы файлов, отсортированные по размеру.
@@ -44,21 +44,105 @@ impl Tree {
         let mut ext_index: HashMap<Box<str>, u16> = HashMap::new();
         let mut type_acc: Vec<TypeStat> = Vec::new();
         tree.push(raw, None, &mut ext_index, &mut type_acc);
+        tree.types = type_acc;
+        tree.sort_types();
+        tree
+    }
 
-        // Переупорядочиваем типы по размеру и перенумеровываем ссылки на них.
-        let mut order: Vec<u16> = (0..type_acc.len() as u16).collect();
-        order.sort_by(|&a, &b| type_acc[b as usize].size.cmp(&type_acc[a as usize].size));
-        let mut remap = vec![0u16; order.len()];
+    /// Упорядочивает типы по размеру, выкидывает опустевшие и перенумеровывает ссылки на них.
+    fn sort_types(&mut self) {
+        let mut order: Vec<u16> = (0..self.types.len() as u16).filter(|&i| self.types[i as usize].files > 0).collect();
+        order.sort_by(|&a, &b| {
+            let (a, b) = (&self.types[a as usize], &self.types[b as usize]);
+            b.size.cmp(&a.size).then_with(|| a.ext.cmp(&b.ext))
+        });
+        let mut remap = vec![u16::MAX; self.types.len()];
         for (new, &old) in order.iter().enumerate() {
             remap[old as usize] = new as u16;
         }
-        for n in &mut tree.nodes {
+        for n in &mut self.nodes {
             if let Some(k) = &mut n.kind {
                 *k = remap[*k as usize];
             }
         }
-        tree.types = order.into_iter().map(|i| type_acc[i as usize].clone()).collect();
-        tree
+        self.types = order.into_iter().map(|i| self.types[i as usize].clone()).collect();
+    }
+
+    /// Убирает узел вместе с содержимым и пересчитывает размеры родителей.
+    /// Сам узел остаётся в `nodes` отцепленным: его id больше нигде не встречается.
+    pub fn remove(&mut self, id: NodeId) {
+        let Some(parent) = self.node(id).parent else { return };
+        let mut stack = vec![id];
+        while let Some(cur) = stack.pop() {
+            let n = &self.nodes[cur as usize];
+            if let Some(k) = n.kind {
+                let t = &mut self.types[k as usize];
+                t.size -= n.size;
+                t.files -= 1;
+            }
+            stack.extend_from_slice(&n.children);
+        }
+        let n = self.node(id);
+        let (size, alloc, files) = (n.size, n.alloc, n.files);
+        self.nodes[parent as usize].children.retain(|&c| c != id);
+        self.nodes[id as usize].parent = None;
+        self.nodes[id as usize].children.clear();
+        self.bump(parent, -(size as i128), -(alloc as i128), -(files as i128));
+        self.sort_types();
+    }
+
+    /// Добавляет `raw` (свежий результат [`crate::scan::scan`]) внутрь папки `parent`.
+    pub fn insert(&mut self, parent: NodeId, raw: RawNode) -> NodeId {
+        let mut ext_index: HashMap<Box<str>, u16> =
+            self.types.iter().enumerate().map(|(i, t)| (t.ext.clone(), i as u16)).collect();
+        let mut types = std::mem::take(&mut self.types);
+        let id = self.push(raw, Some(parent), &mut ext_index, &mut types);
+        self.types = types;
+        let n = self.node(id);
+        let (size, alloc, files) = (n.size, n.alloc, n.files);
+        self.nodes[parent as usize].children.push(id);
+        self.bump(parent, size as i128, alloc as i128, files as i128);
+        self.sort_types();
+        id
+    }
+
+    /// Прибавляет разницу к узлу и всем предкам и пересортировывает их детей
+    /// (порядок «крупное сверху»).
+    fn bump(&mut self, from: NodeId, size: i128, alloc: i128, files: i128) {
+        let mut cur = Some(from);
+        while let Some(id) = cur {
+            let n = &mut self.nodes[id as usize];
+            n.size = (n.size as i128 + size).max(0) as u64;
+            n.alloc = (n.alloc as i128 + alloc).max(0) as u64;
+            n.files = (n.files as i128 + files).max(0) as u64;
+            cur = n.parent;
+            self.sort_children(id);
+        }
+    }
+
+    fn sort_children(&mut self, id: NodeId) {
+        let mut kids = std::mem::take(&mut self.nodes[id as usize].children);
+        kids.sort_by(|&a, &b| {
+            let (a, b) = (self.node(a), self.node(b));
+            b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name))
+        });
+        self.nodes[id as usize].children = kids;
+    }
+
+    /// Узел по полному пути на диске.
+    pub fn find(&self, path: &std::path::Path) -> Option<NodeId> {
+        let rel = path.strip_prefix(&*self.node(Self::ROOT).name).ok()?;
+        let mut cur = Self::ROOT;
+        for comp in rel.components() {
+            let name = comp.as_os_str().to_string_lossy();
+            cur = *self.node(cur).children.iter().find(|&&c| *self.node(c).name == *name)?;
+        }
+        Some(cur)
+    }
+
+    /// Жив ли узел (не убран через [`Tree::remove`]).
+    pub fn contains(&self, id: NodeId) -> bool {
+        id == Self::ROOT || self.nodes.get(id as usize).is_some_and(|n| n.parent.is_some())
     }
 
     fn push(
@@ -189,6 +273,7 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn file(name: &str, size: u64) -> RawNode {
         RawNode { name: name.into(), size, alloc: size, ..Default::default() }
@@ -223,6 +308,43 @@ mod tests {
         assert_eq!(mp4.kind, Some(0), "индексы типов перенумерованы");
         assert_eq!(t.path(t.node(root.children[0]).children[1]), std::path::Path::new("/r/dir/b.mp4"));
         assert!((t.share_of_parent(root.children[0]) - 5.0 / 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn remove_and_insert_keep_totals() {
+        let raw = RawNode {
+            name: "/r".into(),
+            is_dir: true,
+            children: vec![
+                file("a.txt", 100),
+                RawNode { name: "d".into(), is_dir: true, size: 50, alloc: 50, children: vec![file("b.png", 50)] },
+            ],
+            size: 150,
+            alloc: 150,
+        };
+        let mut t = Tree::from_raw(raw);
+        let d = t.find(Path::new("/r/d")).unwrap();
+        let a = t.find(Path::new("/r/a.txt")).unwrap();
+        assert_eq!(t.node(Tree::ROOT).children, vec![a, d]);
+
+        // В папку d кладём крупный файл: она становится первой, корень растёт.
+        let big = t.insert(d, file("big.png", 1000));
+        assert_eq!(t.node(Tree::ROOT).size, 1150);
+        assert_eq!(t.node(Tree::ROOT).files, 3);
+        assert_eq!(t.node(Tree::ROOT).children, vec![d, a]);
+        assert_eq!(t.node(d).children[0], big);
+        assert_eq!(&*t.types[0].ext, "png");
+        assert_eq!(t.types[0].files, 2);
+        assert_eq!(t.path(big), Path::new("/r/d/big.png"));
+
+        // Убираем папку целиком: тип png исчезает, индексы типов пересчитаны.
+        t.remove(d);
+        assert!(!t.contains(d) && t.contains(a));
+        assert_eq!(t.node(Tree::ROOT).size, 100);
+        assert_eq!(t.node(Tree::ROOT).files, 1);
+        assert_eq!(t.types.len(), 1);
+        assert_eq!(t.node(a).kind, Some(0));
+        assert_eq!(t.find(Path::new("/r/d")), None);
     }
 
     #[test]
