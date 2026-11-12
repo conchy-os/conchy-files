@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+# Единый KDL-конфиг Conchy OS: канал `files` (~/.config/conchy/files.kdl).
+conchy-config = { path = "../conchy-config" }
+# Запись настроек через демон org.conchy.Config (версия та же, что у conchy-config).
+zbus = "5"
 futures = "0.3"
 gpui = "0.2.2"
 libc = "0.2"

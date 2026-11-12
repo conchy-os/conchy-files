@@ -6,6 +6,7 @@ pub mod model;
 pub mod ops;
 pub mod places;
 pub mod scan;
+pub mod settings;
 pub mod trash;
 pub mod treemap;
 pub mod watch;

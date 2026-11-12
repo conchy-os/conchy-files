@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone)]
 struct SubDir {
@@ -26,16 +26,33 @@ struct Theme {
 
 #[derive(Debug, Default)]
 pub struct Icons {
+    name: String,
     chain: Vec<Theme>,
     /// Иконки вне тем (`/usr/share/pixmaps`).
     fallback: Vec<PathBuf>,
     cache: Mutex<HashMap<(String, u32), Option<PathBuf>>>,
 }
 
-/// Тема пользователя. Загружается один раз.
-pub fn icons() -> &'static Icons {
-    static I: OnceLock<Icons> = OnceLock::new();
-    I.get_or_init(|| Icons::load(&user_theme_name(), &base_dirs()))
+static CURRENT: RwLock<Option<Arc<Icons>>> = RwLock::new(None);
+
+/// Текущая тема. При первом обращении — тема GTK пользователя.
+pub fn icons() -> Arc<Icons> {
+    if let Some(i) = CURRENT.read().unwrap().as_ref() {
+        return i.clone();
+    }
+    let mut w = CURRENT.write().unwrap();
+    w.get_or_insert_with(|| Arc::new(Icons::load(&user_theme_name(), &base_dirs()))).clone()
+}
+
+/// Меняет тему (из `files.kdl`). `None` — тема GTK пользователя. Возвращает `true`, если сменилась.
+pub fn set_theme(name: Option<&str>) -> bool {
+    let name = name.map(str::to_string).unwrap_or_else(user_theme_name);
+    let mut w = CURRENT.write().unwrap();
+    if w.as_ref().is_some_and(|i| i.name == name) {
+        return false;
+    }
+    *w = Some(Arc::new(Icons::load(&name, &base_dirs())));
+    true
 }
 
 fn base_dirs() -> Vec<PathBuf> {
@@ -90,7 +107,7 @@ impl Icons {
             }
         }
         let fallback = bases.iter().filter_map(|b| b.parent().map(|p| p.join("pixmaps"))).collect();
-        Icons { chain: chain.into_iter().map(|(_, t)| t).collect(), fallback, cache: Mutex::default() }
+        Icons { name: theme.to_string(), chain: chain.into_iter().map(|(_, t)| t).collect(), fallback, cache: Mutex::default() }
     }
 
     /// Первая найденная иконка из списка имён (от точного к общему) для размера `size`.

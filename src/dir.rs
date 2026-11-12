@@ -43,6 +43,11 @@ impl Entry {
     }
 
     pub fn from_path(path: &Path) -> io::Result<Entry> {
+        Self::read(path, true)
+    }
+
+    /// `count_items` — считать ли элементы внутри папок (это чтение каждой подпапки).
+    pub fn read(path: &Path, count_items: bool) -> io::Result<Entry> {
         let lmeta = fs::symlink_metadata(path)?;
         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
         let is_symlink = lmeta.file_type().is_symlink();
@@ -57,7 +62,7 @@ impl Entry {
         let is_dir = meta.is_dir();
         // Тип только по имени: содержимое читать здесь слишком дорого (см. `mime::guess_fast`).
         let mime = if broken { mime::SYMLINK.to_string() } else { mime::db().guess_fast(&name, is_dir, meta.mode()) };
-        let items = if is_dir { fs::read_dir(path).ok().map(|d| d.count() as u64) } else { None };
+        let items = if is_dir && count_items { fs::read_dir(path).ok().map(|d| d.count() as u64) } else { None };
         Ok(Entry {
             name,
             path: path.to_path_buf(),
@@ -75,9 +80,10 @@ impl Entry {
 }
 
 /// Читает папку. Элементы, у которых не удалось прочитать свойства, пропускаются.
-pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
+/// `count_items` — заполнять ли [`Entry::items`] у подпапок.
+pub fn list(dir: &Path, count_items: bool) -> io::Result<Vec<Entry>> {
     let rd = fs::read_dir(dir)?;
-    Ok(rd.flatten().filter_map(|e| Entry::from_path(&e.path()).ok()).collect())
+    Ok(rd.flatten().filter_map(|e| Entry::read(&e.path(), count_items).ok()).collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,7 +237,8 @@ mod tests {
         fs::write(d.join(".hidden"), "").unwrap();
         std::os::unix::fs::symlink("nowhere", d.join("broken")).unwrap();
 
-        let mut v = list(&d).unwrap();
+        assert_eq!(list(&d, false).unwrap().iter().find(|e| e.is_dir).unwrap().items, None);
+        let mut v = list(&d, true).unwrap();
         sort(&mut v, Sort::default());
         let names: Vec<_> = v.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Папка", "a9.txt", "a10.txt", "b.txt", "broken", ".hidden"]);

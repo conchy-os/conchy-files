@@ -24,16 +24,23 @@ fn main() {
         .unwrap_or_else(conchy_files::places::home);
     let start = std::fs::canonicalize(&start).unwrap_or(start);
 
+    // ~/.config/conchy/files.kdl; ошибку в файле покажем, но окно откроем с настройками по умолчанию.
+    let settings = std::sync::Arc::new(conchy_files::settings::Settings::open());
+    let config = settings.load().unwrap_or_else(|e| {
+        eprintln!("conchy-files: {}: {e}", settings.path().display());
+        Default::default()
+    });
+
     Application::new().with_assets(FsAssets).run(move |cx: &mut App| {
         ui::bind_keys(cx);
-        let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
+        let bounds = Bounds::centered(None, size(px(config.width as f32), px(config.height as f32)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some("conchy-files".into()),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| ui::FilesWindow::new(start.clone(), window, cx)),
+            |window, cx| cx.new(|cx| ui::FilesWindow::new(start.clone(), settings.clone(), config.clone(), window, cx)),
         )
         .unwrap();
         cx.on_window_closed(|cx| {

@@ -13,7 +13,7 @@ fn main() {
     let init = t.elapsed();
 
     let t = Instant::now();
-    let mut entries = dir::list(path.as_ref()).expect("папка читается");
+    let mut entries = dir::list(path.as_ref(), true).expect("папка читается");
     let read = t.elapsed();
 
     let t = Instant::now();

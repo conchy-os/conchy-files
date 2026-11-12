@@ -8,11 +8,13 @@ mod view;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use conchy_files::dir::{self, Entry, Sort, SortKey, TrashInfo};
 use conchy_files::model::human_size;
 use conchy_files::places::{self, Mount, Place, Target};
+use conchy_files::settings::{FilesConfig, FolderSize, Settings, SortBy};
 use conchy_files::{icons, mime, trash, watch};
 use futures::StreamExt;
 use gpui::{
@@ -134,6 +136,11 @@ pub struct FilesWindow {
     _watch: Option<watch::Watch>,
     title: String,
 
+    /// Канал `files` единого конфига Conchy (`~/.config/conchy/files.kdl`).
+    settings: Arc<Settings>,
+    config: FilesConfig,
+    _config_watch: Option<watch::Watch>,
+
     clipboard: Option<Clip>,
     undo: Vec<conchy_files::ops::Record>,
     job: Option<Job>,
@@ -143,9 +150,16 @@ pub struct FilesWindow {
 }
 
 impl FilesWindow {
-    pub fn new(start: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        start: PathBuf,
+        settings: Arc<Settings>,
+        config: FilesConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window);
+        icons::set_theme(config.icon_theme.as_deref());
         let special_icons = places::user_dirs()
             .into_iter()
             .map(|(_, p)| {
@@ -168,8 +182,8 @@ impl FilesWindow {
             forward: Vec::new(),
             rows: Vec::new(),
             visible: Vec::new(),
-            sort: Sort::default(),
-            show_hidden: false,
+            sort: sort_from(&config),
+            show_hidden: config.show_hidden,
             loading: false,
             load_error: None,
             load_gen: 0,
@@ -186,6 +200,9 @@ impl FilesWindow {
             special_icons,
             _watch: None,
             title: String::new(),
+            settings,
+            config,
+            _config_watch: None,
             clipboard: None,
             undo: Vec::new(),
             job: None,
@@ -195,7 +212,83 @@ impl FilesWindow {
         };
         this.set_location(location, select, cx);
         this.poll_mounts(cx);
+        this.watch_config(cx);
         this
+    }
+
+    // ---------- настройки (files.kdl) ----------
+
+    /// Следит за `~/.config/conchy`: правки руками, `conchy-config set files …` и записи
+    /// демона применяются сразу, без перезапуска.
+    fn watch_config(&mut self, cx: &mut Context<Self>) {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        let Ok(w) = self.settings.watch(move || {
+            let _ = tx.unbounded_send(());
+        }) else {
+            return;
+        };
+        self._config_watch = Some(w);
+        cx.spawn(async move |this, cx| {
+            while rx.next().await.is_some() {
+                if this.update(cx, |this, cx| this.reload_config(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn reload_config(&mut self, cx: &mut Context<Self>) {
+        match self.settings.load() {
+            Ok(c) => self.apply_config(c, cx),
+            // Ошибка в файле: оставляем прежние настройки и говорим, где искать.
+            Err(e) => {
+                let first = e.lines().next().unwrap_or_default().to_string();
+                self.notice(format!("files.kdl не применён: {first}"), cx);
+            }
+        }
+    }
+
+    fn apply_config(&mut self, c: FilesConfig, cx: &mut Context<Self>) {
+        if c == self.config {
+            return;
+        }
+        let old = std::mem::replace(&mut self.config, c);
+        let mut reload = old.folder_size != self.config.folder_size;
+        if old.icon_theme != self.config.icon_theme && icons::set_theme(self.config.icon_theme.as_deref()) {
+            reload = true;
+        }
+        let sort = sort_from(&self.config);
+        if sort != self.sort {
+            self.sort = sort;
+            dir::sort(&mut self.rows, sort);
+        }
+        if self.config.show_hidden != self.show_hidden {
+            self.show_hidden = self.config.show_hidden;
+            let hidden: HashSet<PathBuf> =
+                self.rows.iter().filter(|r| r.entry.is_hidden()).map(|r| r.entry.path.clone()).collect();
+            if !self.show_hidden {
+                self.selected.retain(|p| !hidden.contains(p));
+            }
+        }
+        self.rebuild_visible();
+        if reload {
+            self.reload(cx);
+        }
+        self.notice("Настройки из files.kdl применены", cx);
+        cx.notify();
+    }
+
+    /// Запоминает значения в `files.kdl` (в фоне: запись идёт через D-Bus или файл).
+    fn save_settings(&mut self, values: Vec<(&'static str, String)>, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
+        cx.background_executor()
+            .spawn(async move {
+                for (k, v) in values {
+                    let _ = settings.set(k, &v);
+                }
+            })
+            .detach();
     }
 
     // ---------- загрузка ----------
@@ -209,7 +302,10 @@ impl FilesWindow {
         let tops: Vec<PathBuf> = self.mounts.iter().map(|m| m.mount_point.clone()).collect();
         let sort = self.sort;
         let special = self.special_icons.clone();
-        let job = cx.background_executor().spawn(async move { read_location(&target, &tops, sort, &special) });
+        let count_items = self.config.folder_size == FolderSize::Items;
+        let job = cx
+            .background_executor()
+            .spawn(async move { read_location(&target, &tops, sort, count_items, &special) });
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let res = job.await;
             let _ = this.update(cx, |this, cx| {
@@ -317,6 +413,16 @@ impl FilesWindow {
         dir::sort(&mut self.rows, self.sort);
         self.rebuild_visible();
         self.scroll_to_cursor();
+        // Как Thunar: последняя сортировка запоминается.
+        self.config.sort_by = match key {
+            SortKey::Name => SortBy::Name,
+            SortKey::Size => SortBy::Size,
+            SortKey::Type => SortBy::Type,
+            SortKey::Modified => SortBy::Modified,
+        };
+        self.config.sort_ascending = self.sort.ascending;
+        let order = if self.sort.ascending { "ascending" } else { "descending" };
+        self.save_settings(vec![("view.sort-by", self.config.sort_by.as_str().into()), ("view.sort-order", order.into())], cx);
         cx.notify();
     }
 
@@ -683,6 +789,8 @@ impl FilesWindow {
         let present: HashSet<PathBuf> = self.visible.iter().map(|&i| self.rows[i].entry.path.clone()).collect();
         self.selected.retain(|p| present.contains(p));
         self.scroll_to_cursor();
+        self.config.show_hidden = self.show_hidden;
+        self.save_settings(vec![("view.show-hidden", self.show_hidden.to_string())], cx);
         let state = if self.show_hidden { "показаны" } else { "скрыты" };
         self.notice(format!("Скрытые файлы {state} (Ctrl+H)"), cx);
     }
@@ -705,9 +813,15 @@ impl FilesWindow {
 }
 
 /// Читает папку или корзину и готовит строки (в фоне).
-fn read_location(target: &Target, tops: &[PathBuf], sort: Sort, special: &HashMap<PathBuf, String>) -> Result<Vec<Row>, String> {
+fn read_location(
+    target: &Target,
+    tops: &[PathBuf],
+    sort: Sort,
+    count_items: bool,
+    special: &HashMap<PathBuf, String>,
+) -> Result<Vec<Row>, String> {
     let entries = match target {
-        Target::Dir(p) => dir::list(p).map_err(|e| match e.kind() {
+        Target::Dir(p) => dir::list(p, count_items).map_err(|e| match e.kind() {
             std::io::ErrorKind::PermissionDenied => "Нет доступа к этой папке".to_string(),
             std::io::ErrorKind::NotFound => "Папка не существует".to_string(),
             _ => e.to_string(),
@@ -743,6 +857,16 @@ fn read_location(target: &Target, tops: &[PathBuf], sort: Sort, special: &HashMa
         .collect();
     dir::sort(&mut rows, sort);
     Ok(rows)
+}
+
+fn sort_from(c: &FilesConfig) -> Sort {
+    let key = match c.sort_by {
+        SortBy::Name => SortKey::Name,
+        SortBy::Size => SortKey::Size,
+        SortBy::Type => SortKey::Type,
+        SortBy::Modified => SortKey::Modified,
+    };
+    Sort { key, ascending: c.sort_ascending, folders_first: c.folders_first }
 }
 
 /// Иконка и подпись колонки «Тип» (в корзине — исходная папка).
@@ -859,7 +983,7 @@ impl Render for FilesWindow {
             .flex_col()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .text_size(px(13.))
+            .text_size(px(self.config.font_size))
             .child(self.render_toolbar(cx))
             .child(div().flex().flex_1().min_h_0().child(self.render_sidebar(cx)).child(self.render_list(cx)))
             .child(self.render_status(cx))

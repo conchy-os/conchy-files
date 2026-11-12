@@ -38,6 +38,38 @@ cargo run --release -- ~/Документы   # папка или файл; по
 
 В `Cargo.lock` зафиксирована `libc` 0.2.188: крейт `xattr` 0.2.3, который тянет GPUI 0.2.2, не собирается с `libc` 0.2.191. Не запускайте `cargo update` целиком, обновляйте пакеты по одному.
 
+## Настройки
+
+conchy-files входит в единый KDL-конфиг Conchy OS ([conchy-config](https://github.com/conchy-os/conchy-config)), канал `files`: файл `~/.config/conchy/files.kdl`. Он создаётся при первом запуске с комментариями; другие файлы (`wm.kdl`, `session.kdl`) программа не трогает.
+
+```kdl
+view {
+    show-hidden false        // Ctrl+H; conchy-files saves it here
+    folders-first true
+    sort-by "name"           // name, size, type, modified
+    sort-order "ascending"   // ascending, descending
+    folder-size "items"      // items: "12 items"; none: faster on huge folders
+}
+window {
+    width 1100
+    height 720
+    sidebar-width 210
+}
+terminal {
+    command ""               // "Open Terminal Here"; empty: $TERMINAL or auto
+}
+theme {
+    icon-theme ""            // empty: same as GTK apps
+    font-size 13
+}
+```
+
+- Изменения применяются сразу, без перезапуска: правка в редакторе, `conchy-config set files view.sort-by size` или любой настройщик через D-Bus `org.conchy.Config`.
+- Окно само запоминает `Ctrl+H` и сортировку по щелчку на заголовке. Запись идёт через демон, чтобы остальные программы получили `PropertyChanged`; если демон не запущен — прямо в файл, комментарии сохраняются.
+- Ошибка в файле не ломает окно: остаются прежние настройки, в строке состояния видно, что не так.
+
+Для сборки `conchy-config` должен лежать рядом: `../conchy-config`.
+
 ## Клавиши
 
 Как в Thunar 4.20.
@@ -71,6 +103,7 @@ src/
 ├── icons.rs     поиск иконок по теме freedesktop
 ├── places.rs    «Места» и «Устройства»: XDG-папки, закладки GTK, разделы
 ├── watch.rs     слежение за папкой через inotify
+├── settings.rs  канал `files` единого KDL-конфига (conchy-config)
 ├── ops.rs       операции с файлами, конфликты, отмена
 ├── trash.rs     корзина по спецификации freedesktop.org
 ├── scan.rs      параллельный обход ФС (для анализа места)
@@ -98,7 +131,7 @@ src/
 | 2 | Нижняя панель: treemap, типы, крупные папки; свойства и предпросмотр файла |
 | 3 | Устройства через UDisks2, уведомления, `FileManager1`, одиночный экземпляр |
 | 4 | Виды значками и компактный, миниатюры, поиск, вкладки, повтор действия |
-| 5 | «Открыть с помощью», свойства и права, пользовательские действия, `files.kdl` |
+| 5 | «Открыть с помощью», свойства и права, пользовательские действия в `files.kdl` |
 | 6 | Сеть через FUSE (`sftp://`, `smb://`, MTP) |
 
 ## Лицензия

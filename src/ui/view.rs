@@ -15,8 +15,9 @@ use gpui::{
 
 use super::{ACCENT, BORDER, DIM, FilesWindow, GoBack, GoForward, GoHome, GoUp, PANEL, SEL_BG, TEXT, items_label};
 
+// Размеры при шрифте 13 px; растут вместе с `theme.font-size` из files.kdl.
+const BASE_FONT: f32 = 13.0;
 const ROW_H: f32 = 24.0;
-const SIDEBAR_W: f32 = 210.0;
 const COL_SIZE: f32 = 96.0;
 const COL_TYPE: f32 = 180.0;
 const COL_DATE: f32 = 150.0;
@@ -39,6 +40,11 @@ fn symbolic(name: &str, fallback: &'static str, color: impl Into<Hsla>) -> AnyEl
 }
 
 impl FilesWindow {
+    /// Размер, пересчитанный под шрифт из настроек.
+    fn scaled(&self, v: f32) -> f32 {
+        (v * self.config.font_size / BASE_FONT).round()
+    }
+
     // ---------- панель инструментов ----------
 
     pub(super) fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -142,7 +148,7 @@ impl FilesWindow {
             .id("sidebar")
             .flex()
             .flex_col()
-            .w(px(SIDEBAR_W))
+            .w(px(self.config.sidebar_width as f32))
             .flex_shrink_0()
             .overflow_y_scroll()
             .bg(rgb(PANEL))
@@ -229,15 +235,15 @@ impl FilesWindow {
         };
         let head = div()
             .flex()
-            .h(px(ROW_H))
+            .h(px(self.scaled(ROW_H)))
             .flex_shrink_0()
             .text_color(rgb(DIM))
             .border_b_1()
             .border_color(rgb(BORDER))
             .child(header_cell("h-name", "Имя", SortKey::Name, None, false, cx))
-            .child(header_cell("h-size", "Размер", SortKey::Size, Some(COL_SIZE), true, cx))
-            .child(header_cell("h-type", if trash { "Исходное место" } else { "Тип" }, SortKey::Type, Some(COL_TYPE), false, cx))
-            .child(header_cell("h-date", if trash { "Удалён" } else { "Изменён" }, SortKey::Modified, Some(COL_DATE), false, cx));
+            .child(header_cell("h-size", "Размер", SortKey::Size, Some(self.scaled(COL_SIZE)), true, cx))
+            .child(header_cell("h-type", if trash { "Исходное место" } else { "Тип" }, SortKey::Type, Some(self.scaled(COL_TYPE)), false, cx))
+            .child(header_cell("h-date", if trash { "Удалён" } else { "Изменён" }, SortKey::Modified, Some(self.scaled(COL_DATE)), false, cx));
 
         let body: AnyElement = if let Some(err) = &self.load_error {
             placeholder(err.clone())
@@ -306,7 +312,7 @@ impl FilesWindow {
             .id(("row", pos))
             .flex()
             .items_center()
-            .h(px(ROW_H))
+            .h(px(self.scaled(ROW_H)))
             .w_full()
             .when(selected, |d| d.bg(rgb(SEL_BG)))
             .when(!selected, |d| d.hover(|s| s.bg(hsla(0.0, 0.0, 1.0, 0.04))))
@@ -356,9 +362,9 @@ impl FilesWindow {
                             .child(e.name.clone()),
                     ),
             )
-            .child(cell(COL_SIZE).justify_end().text_color(rgb(DIM)).child(row.size.clone()))
-            .child(cell(COL_TYPE).text_color(rgb(DIM)).child(row.kind.clone()))
-            .child(cell(COL_DATE).text_color(rgb(DIM)).child(row.date.clone()))
+            .child(cell(self.scaled(COL_SIZE)).justify_end().text_color(rgb(DIM)).child(row.size.clone()))
+            .child(cell(self.scaled(COL_TYPE)).text_color(rgb(DIM)).child(row.kind.clone()))
+            .child(cell(self.scaled(COL_DATE)).text_color(rgb(DIM)).child(row.date.clone()))
             .into_any_element()
     }
 

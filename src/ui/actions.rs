@@ -282,13 +282,13 @@ impl FilesWindow {
             _ => self.current_dir().map(Path::to_path_buf),
         };
         let Some(dir) = dir else { return };
-        match terminal() {
+        match terminal(self.config.terminal.clone()) {
             Some(t) => {
                 if let Err(e) = std::process::Command::new(&t).current_dir(&dir).spawn() {
                     self.notice(format!("Не удалось запустить {t}: {e}"), cx);
                 }
             }
-            None => self.notice("Терминал не найден: задайте переменную TERMINAL", cx),
+            None => self.notice("Терминал не найден: укажите terminal.command в files.kdl", cx),
         }
     }
 
@@ -522,9 +522,9 @@ fn delete_title(n: usize, single: Option<String>) -> String {
     }
 }
 
-/// Программа-терминал: `$TERMINAL` или первый найденный из известных.
-fn terminal() -> Option<String> {
-    if let Some(t) = std::env::var("TERMINAL").ok().filter(|t| !t.is_empty()) {
+/// Программа-терминал: из `files.kdl`, иначе `$TERMINAL`, иначе первый найденный из известных.
+fn terminal(configured: Option<String>) -> Option<String> {
+    if let Some(t) = configured.or_else(|| std::env::var("TERMINAL").ok()).filter(|t| !t.trim().is_empty()) {
         return Some(t);
     }
     let path = std::env::var_os("PATH")?;
