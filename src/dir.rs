@@ -55,7 +55,8 @@ impl Entry {
             (lmeta, false)
         };
         let is_dir = meta.is_dir();
-        let mime = if broken { mime::SYMLINK.to_string() } else { mime::db().guess(path, &name, is_dir) };
+        // Тип только по имени: содержимое читать здесь слишком дорого (см. `mime::guess_fast`).
+        let mime = if broken { mime::SYMLINK.to_string() } else { mime::db().guess_fast(&name, is_dir, meta.mode()) };
         let items = if is_dir { fs::read_dir(path).ok().map(|d| d.count() as u64) } else { None };
         Ok(Entry {
             name,

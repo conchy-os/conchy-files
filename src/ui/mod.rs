@@ -215,10 +215,53 @@ impl FilesWindow {
             let _ = this.update(cx, |this, cx| {
                 if this.load_gen == generation {
                     this.apply_load(res, select);
+                    this.refine_types(cx);
                     cx.notify();
                 }
             });
         }));
+    }
+
+    /// Уточняет в фоне типы файлов без говорящего имени (по первым байтам):
+    /// список уже показан, а `/usr/bin` на холодном диске читался бы секунды.
+    fn refine_types(&mut self, cx: &mut Context<Self>) {
+        let generation = self.load_gen;
+        let todo: Vec<(PathBuf, String)> = self
+            .rows
+            .iter()
+            .filter(|r| !r.entry.is_dir && !r.entry.broken && mime::needs_sniff(&r.entry.mime))
+            .map(|r| (r.entry.path.clone(), r.entry.mime.clone()))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        let job = cx.background_executor().spawn(async move {
+            todo.into_iter()
+                .filter_map(|(p, old)| {
+                    let m = mime::sniff(&p);
+                    (m != old).then(|| (p, m.to_string()))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let found = job.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.load_gen != generation || found.is_empty() {
+                    return;
+                }
+                let found: HashMap<PathBuf, String> = found.into_iter().collect();
+                for r in &mut this.rows {
+                    if let Some(m) = found.get(&r.entry.path) {
+                        r.entry.mime = m.clone();
+                        let (icon, kind) = icon_and_kind(&r.entry, &this.special_icons);
+                        r.icon = icon;
+                        r.kind = kind;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -681,22 +724,10 @@ fn read_location(target: &Target, tops: &[PathBuf], sort: Sort, special: &HashMa
             .collect(),
     };
     let now = unsafe { libc::time(std::ptr::null_mut()) } as i64;
-    let db = mime::db();
     let mut rows: Vec<Row> = entries
         .into_iter()
         .map(|e| {
-            let names: Vec<String> = match special.get(&e.path) {
-                Some(icon) if e.is_dir => vec![icon.clone(), "folder".into()],
-                _ if e.is_dir => vec!["folder".into()],
-                _ => db.icon_names(&e.mime),
-            };
-            let icon = icons::icons().lookup(&names, 16);
-            let kind = match &e.trash {
-                Some(t) => t.original.parent().map(|p| p.display().to_string()).unwrap_or_default(),
-                None if e.broken => "Битая ссылка".into(),
-                None if e.is_symlink => format!("Ссылка: {}", db.describe(&e.mime)),
-                None => db.describe(&e.mime),
-            };
+            let (icon, kind) = icon_and_kind(&e, special);
             let size = match e.items {
                 Some(n) if e.is_dir => items_label(n),
                 _ if e.is_dir => "—".into(),
@@ -712,6 +743,24 @@ fn read_location(target: &Target, tops: &[PathBuf], sort: Sort, special: &HashMa
         .collect();
     dir::sort(&mut rows, sort);
     Ok(rows)
+}
+
+/// Иконка и подпись колонки «Тип» (в корзине — исходная папка).
+fn icon_and_kind(e: &Entry, special: &HashMap<PathBuf, String>) -> (Option<PathBuf>, String) {
+    let db = mime::db();
+    let names: Vec<String> = match special.get(&e.path) {
+        Some(icon) if e.is_dir => vec![icon.clone(), "folder".into()],
+        _ if e.is_dir => vec!["folder".into()],
+        _ => db.icon_names(&e.mime),
+    };
+    let icon = icons::icons().lookup(&names, 16);
+    let kind = match &e.trash {
+        Some(t) => t.original.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+        None if e.broken => "Битая ссылка".into(),
+        None if e.is_symlink => format!("Ссылка: {}", db.describe(&e.mime)),
+        None => db.describe(&e.mime),
+    };
+    (icon, kind)
 }
 
 /// «1 элемент», «3 элемента», «7 элементов».

@@ -14,6 +14,13 @@ pub const DIRECTORY: &str = "inode/directory";
 pub const SYMLINK: &str = "inode/symlink";
 pub const UNKNOWN: &str = "application/octet-stream";
 pub const TEXT: &str = "text/plain";
+pub const EXECUTABLE: &str = "application/x-executable";
+pub const SHELLSCRIPT: &str = "application/x-shellscript";
+
+/// Тип получен догадкой без чтения содержимого и может уточниться.
+pub fn needs_sniff(mime: &str) -> bool {
+    mime == UNKNOWN || mime == EXECUTABLE
+}
 
 #[derive(Debug, Default)]
 pub struct MimeDb {
@@ -137,6 +144,20 @@ impl MimeDb {
         sniff(path).to_string()
     }
 
+    /// Тип без чтения файла: по имени, а для безымянных — по праву на запуск.
+    /// Для списка папки: чтение начала тысяч файлов на холодном диске занимает секунды.
+    /// Уточнить такие типы можно потом через [`sniff`] (см. [`needs_sniff`]).
+    pub fn guess_fast(&self, name: &str, is_dir: bool, mode: u32) -> String {
+        if is_dir {
+            return DIRECTORY.into();
+        }
+        match self.by_name(name) {
+            Some(m) => self.unalias(m).to_string(),
+            None if mode & 0o111 != 0 => EXECUTABLE.into(),
+            None => UNKNOWN.into(),
+        }
+    }
+
     pub fn unalias<'a>(&'a self, mime: &'a str) -> &'a str {
         self.aliases.get(mime).map_or(mime, String::as_str)
     }
@@ -200,8 +221,9 @@ fn unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
-/// Текст или двоичные данные — по первым 512 байтам, как делает GIO для неизвестных имён.
-fn sniff(path: &Path) -> &'static str {
+/// Тип по первым 512 байтам, для файлов, имя которых ничего не говорит:
+/// программа (ELF), скрипт (`#!`), текст или двоичные данные.
+pub fn sniff(path: &Path) -> &'static str {
     let mut buf = [0u8; 512];
     let n = match fs::File::open(path).and_then(|mut f| f.read(&mut buf)) {
         Ok(n) => n,
@@ -210,6 +232,12 @@ fn sniff(path: &Path) -> &'static str {
     let head = &buf[..n];
     if n == 0 {
         return TEXT;
+    }
+    if head.starts_with(b"\x7fELF") {
+        return EXECUTABLE;
+    }
+    if head.starts_with(b"#!") {
+        return SHELLSCRIPT;
     }
     if head.contains(&0) {
         return UNKNOWN;
@@ -311,8 +339,16 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         fs::write(d.join("t"), "привет\n").unwrap();
         fs::write(d.join("b"), [0u8, 1, 2]).unwrap();
+        fs::write(d.join("s"), "#!/bin/sh\n").unwrap();
+        fs::write(d.join("e"), b"\x7fELF\x02\x01\x01\0").unwrap();
         assert_eq!(sniff(&d.join("t")), TEXT);
         assert_eq!(sniff(&d.join("b")), UNKNOWN);
+        assert_eq!(sniff(&d.join("s")), SHELLSCRIPT);
+        assert_eq!(sniff(&d.join("e")), EXECUTABLE);
+        let db = MimeDb::default();
+        assert_eq!(db.guess_fast("run", false, 0o755), EXECUTABLE);
+        assert_eq!(db.guess_fast("data", false, 0o644), UNKNOWN);
+        assert!(needs_sniff(UNKNOWN) && !needs_sniff(TEXT));
         fs::remove_dir_all(&d).unwrap();
     }
 
