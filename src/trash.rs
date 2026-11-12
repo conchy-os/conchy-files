@@ -107,6 +107,114 @@ pub fn restore(item: &TrashedItem) -> io::Result<()> {
     Ok(())
 }
 
+/// Запись в корзине с датой удаления (секунды Unix, 0 — неизвестна).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub item: TrashedItem,
+    pub deleted: i64,
+}
+
+/// Всё содержимое корзин: домашней и корзин разделов `topdirs`
+/// (обычно точки монтирования из «Устройств»).
+pub fn list(topdirs: &[PathBuf]) -> Vec<Listed> {
+    let uid = unsafe { libc::geteuid() };
+    let mut dirs: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    if let Ok(h) = home_trash_dir() {
+        dirs.push((h, None));
+    }
+    for top in topdirs {
+        dirs.push((top.join(".Trash").join(uid.to_string()), Some(top.clone())));
+        dirs.push((top.join(format!(".Trash-{uid}")), Some(top.clone())));
+    }
+    let mut out = Vec::new();
+    for (dir, top) in dirs {
+        let Ok(entries) = fs::read_dir(dir.join("info")) else { continue };
+        for e in entries.flatten() {
+            let info = e.path();
+            let Some(stem) = info.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".trashinfo")) else {
+                continue;
+            };
+            let file = dir.join("files").join(stem);
+            if fs::symlink_metadata(&file).is_err() {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&info) else { continue };
+            let Some((path, deleted)) = parse_info(&body) else { continue };
+            let original = match &top {
+                Some(t) if path.is_relative() => t.join(path),
+                _ => path,
+            };
+            out.push(Listed { item: TrashedItem { original, file, info }, deleted });
+        }
+    }
+    out
+}
+
+/// Удаляет из корзины насовсем.
+pub fn erase(item: &TrashedItem) -> io::Result<()> {
+    let meta = fs::symlink_metadata(&item.file)?;
+    if meta.is_dir() {
+        fs::remove_dir_all(&item.file)?;
+    } else {
+        fs::remove_file(&item.file)?;
+    }
+    let _ = fs::remove_file(&item.info);
+    Ok(())
+}
+
+fn parse_info(body: &str) -> Option<(PathBuf, i64)> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut path = None;
+    let mut deleted = 0;
+    for line in body.lines() {
+        if let Some(p) = line.strip_prefix("Path=") {
+            path = Some(PathBuf::from(OsString::from_vec(percent_decode(p))));
+        } else if let Some(d) = line.strip_prefix("DeletionDate=") {
+            deleted = parse_local_time(d).unwrap_or(0);
+        }
+    }
+    Some((path?, deleted))
+}
+
+/// `2026-11-12T10:41:05` в местном времени → секунды Unix.
+fn parse_local_time(s: &str) -> Option<i64> {
+    let (date, time) = s.split_once('T')?;
+    let d: Vec<i32> = date.split('-').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    let t: Vec<i32> = time.split(':').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    if d.len() != 3 || t.len() < 2 {
+        return None;
+    }
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = d[0] - 1900;
+    tm.tm_mon = d[1] - 1;
+    tm.tm_mday = d[2];
+    tm.tm_hour = t[0];
+    tm.tm_min = t[1];
+    tm.tm_sec = *t.get(2).unwrap_or(&0);
+    tm.tm_isdst = -1;
+    let r = unsafe { libc::mktime(&mut tm) };
+    (r != -1).then_some(r as i64)
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 fn home_trash_dir() -> io::Result<PathBuf> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -252,8 +360,14 @@ mod tests {
         assert!(info.starts_with("[Trash Info]\nPath=/"), "{info}");
         assert!(info.contains("sub/f.txt\nDeletionDate=20"), "{info}");
 
+        let listed = list(&[]);
+        let la = listed.iter().find(|l| l.item == a).expect("в списке корзины");
+        assert!(la.deleted > 0, "дата удаления разобрана");
+        assert_eq!(la.item.original, base.join("data/sub/f.txt"), "путь раскодирован");
+
         restore(&b).unwrap();
         assert_eq!(fs::read(base.join("data/f.txt")).unwrap(), b"other");
+        assert!(!list(&[]).iter().any(|l| l.item == b));
         assert!(!b.info.exists());
         // Место занято: не перезаписываем.
         fs::write(base.join("data/sub/f.txt"), b"new").unwrap();

@@ -1,5 +1,5 @@
-//! Модальные диалоги (имя, подтверждение удаления, конфликт, ошибки)
-//! и контекстное меню. Всё рисуется поверх основного окна, раскладка не меняется.
+//! Модальные диалоги (имя, подтверждение, конфликт, ошибки) и контекстное меню.
+//! Всё рисуется поверх окна.
 
 use std::path::PathBuf;
 
@@ -11,12 +11,15 @@ use gpui::{
 
 use super::actions::{Cmd, ConflictRequest, JobKind};
 use super::field::TextField;
-use super::{ACCENT, BG, BORDER, DIM, FilesView, PANEL, SEL_BG, TEXT};
+use conchy_files::trash::TrashedItem;
+
+use super::{ACCENT, BG, BORDER, DANGER, DIM, FilesWindow, PANEL, SEL_BG, TEXT};
 
 pub(super) enum Dialog {
     /// Ввод имени: переименование или создание.
     Name { purpose: NamePurpose, field: TextField, error: Option<String> },
-    ConfirmDelete { paths: Vec<PathBuf> },
+    /// Подтверждение необратимого действия.
+    Confirm { title: String, body: String, ok: &'static str, action: ConfirmAction },
     Conflict { req: ConflictRequest, apply_all: bool },
     Errors { title: String, errors: Vec<(PathBuf, String)> },
 }
@@ -26,16 +29,42 @@ pub(super) enum NamePurpose {
     Create { parent: PathBuf, is_dir: bool },
 }
 
-/// Открытое контекстное меню: где щёлкнули.
-pub(super) struct Menu {
-    pub pos: Point<Pixels>,
+pub(super) enum ConfirmAction {
+    /// Удалить насовсем, минуя корзину.
+    Delete(Vec<PathBuf>),
+    /// Удалить из корзины (в том числе «Очистить корзину»).
+    Erase(Vec<TrashedItem>),
 }
 
-const MENU_W: f32 = 250.0;
-const MENU_ITEM_H: f32 = 24.0;
-const DANGER: u32 = 0xf7768e;
+/// Открытое контекстное меню: где щёлкнули и что в нём (`None` — разделитель).
+pub(super) struct Menu {
+    pub pos: Point<Pixels>,
+    pub items: Vec<Option<MenuItem>>,
+}
 
-impl FilesView {
+pub(super) struct MenuItem {
+    pub label: String,
+    pub keys: &'static str,
+    pub cmd: Cmd,
+    pub enabled: bool,
+    pub danger: bool,
+}
+
+impl MenuItem {
+    pub fn new(label: impl Into<String>, keys: &'static str, cmd: Cmd, enabled: bool) -> Self {
+        MenuItem { label: label.into(), keys, cmd, enabled, danger: false }
+    }
+
+    pub fn danger(mut self) -> Self {
+        self.danger = true;
+        self
+    }
+}
+
+const MENU_W: f32 = 260.0;
+const MENU_ITEM_H: f32 = 26.0;
+
+impl FilesWindow {
     // ---------- клавиатура ----------
 
     pub(super) fn on_dialog_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -105,8 +134,11 @@ impl FilesView {
                     }
                 }
             }
-            Some(Dialog::ConfirmDelete { paths }) => {
-                self.run_job("Удаление", JobKind::Normal, cx, move |p, _| ops::delete_all(&paths, p));
+            Some(Dialog::Confirm { action: ConfirmAction::Delete(paths), .. }) => {
+                self.run_job("Удаление", JobKind::NoUndo, cx, move |p, _| ops::delete_all(&paths, p));
+            }
+            Some(Dialog::Confirm { action: ConfirmAction::Erase(items), .. }) => {
+                self.run_job("Удаление из корзины", JobKind::NoUndo, cx, move |p, _| ops::erase_all(&items, p));
             }
             Some(Dialog::Conflict { req, apply_all }) => {
                 let resolution = if req.conflict.can_merge() { Resolution::Merge } else { Resolution::Replace };
@@ -143,19 +175,13 @@ impl FilesView {
                         button("ok", ok, true, cx, |this, cx| this.dialog_confirm(cx)),
                     ))
             }
-            Dialog::ConfirmDelete { paths } => {
-                let what = match &paths[..] {
-                    [one] => format!("Удалить насовсем «{}»?", ops::display_name(one)),
-                    _ => format!("Удалить насовсем выбранные элементы ({})?", paths.len()),
-                };
-                card(what)
-                    .child(div().text_color(rgb(DIM)).child("Элементы не попадут в корзину, восстановить их будет нельзя."))
-                    .child(
-                        buttons()
-                            .child(button("cancel", "Отмена", false, cx, |this, cx| this.dialog_cancel(cx)))
-                            .child(button("ok", "Удалить", true, cx, |this, cx| this.dialog_confirm(cx))),
-                    )
-            }
+            Dialog::Confirm { title, body, ok, .. } => card(title.clone())
+                .child(div().text_color(rgb(DIM)).child(body.clone()))
+                .child(
+                    buttons()
+                        .child(button("cancel", "Отмена", false, cx, |this, cx| this.dialog_cancel(cx)))
+                        .child(button("ok", ok, true, cx, |this, cx| this.dialog_confirm(cx)).bg(rgb(DANGER)).border_color(rgb(DANGER))),
+                ),
             Dialog::Conflict { req, apply_all } => {
                 let c = &req.conflict;
                 let parent = c.dst.parent().map(ops::display_name).unwrap_or_default();
@@ -253,49 +279,9 @@ impl FilesView {
 
     // ---------- контекстное меню ----------
 
-    /// Открывает меню у курсора для элемента `id`. Если он не входит в отмеченные,
-    /// отметки сбрасываются, как при обычном клике.
-    pub(super) fn open_menu(&mut self, id: conchy_files::model::NodeId, pos: Point<Pixels>, cx: &mut Context<Self>) {
-        if !self.marked.contains(&id) {
-            self.marked.clear();
-        }
-        self.selected = id;
-        self.menu = Some(Menu { pos });
-        cx.notify();
-    }
-
     pub(super) fn render_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.menu.as_ref()?;
-        let tree = self.tree.as_ref()?;
-        let targets = self.targets();
-        let has = !targets.is_empty();
-        let single = targets.len() == 1;
-        let selected_is_dir = tree.node(self.selected).is_dir;
-        let undo = self.undo.last().map(|r| format!("Отменить {}", r.describe()));
-
-        let open = if selected_is_dir { "Открыть в программе" } else { "Открыть" };
-        let items: Vec<Option<(String, &str, Cmd, bool)>> = vec![
-            Some((open.into(), "O", Cmd::Open, true)),
-            None,
-            Some(("Вырезать".into(), "Ctrl+X", Cmd::Cut, has)),
-            Some(("Копировать".into(), "Ctrl+C", Cmd::Copy, has)),
-            Some((
-                if selected_is_dir { "Вставить в папку".into() } else { "Вставить".into() },
-                "Ctrl+V",
-                Cmd::Paste,
-                self.can_paste(),
-            )),
-            Some(("Копировать путь".into(), "Ctrl+Shift+C", Cmd::CopyPath, has)),
-            None,
-            Some(("Переименовать…".into(), "F2", Cmd::Rename, single)),
-            Some(("Создать папку…".into(), "Ctrl+Shift+N", Cmd::NewFolder, true)),
-            Some(("Создать пустой файл…".into(), "", Cmd::NewFile, true)),
-            None,
-            Some(("В корзину".into(), "Delete", Cmd::Trash, has)),
-            Some(("Удалить насовсем…".into(), "Shift+Delete", Cmd::Delete, has)),
-            None,
-            Some((undo.clone().unwrap_or_else(|| "Отменить".into()), "Ctrl+Z", Cmd::Undo, undo.is_some())),
-        ];
+        let items = &menu.items;
 
         // Не даём меню вылезти за край окна.
         let vp = window.viewport_size();
@@ -318,12 +304,12 @@ impl FilesView {
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
-        for (i, item) in items.into_iter().enumerate() {
-            let Some((label, keys, cmd, enabled)) = item else {
+        for (i, item) in items.iter().enumerate() {
+            let Some(MenuItem { label, keys, cmd, enabled, danger }) = item else {
                 list = list.child(div().my(px(4.)).h(px(1.)).bg(rgb(BORDER)));
                 continue;
             };
-            let danger = cmd == Cmd::Delete;
+            let (cmd, enabled, danger) = (*cmd, *enabled, *danger);
             list = list.child(
                 div()
                     .id(("menu", i))
@@ -342,7 +328,7 @@ impl FilesView {
                             .hover(|s| s.bg(rgb(SEL_BG)))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.run_cmd(cmd, cx)))
                     })
-                    .child(label)
+                    .child(label.clone())
                     .child(div().text_color(rgb(DIM)).child(keys.to_string())),
             );
         }
@@ -395,8 +381,8 @@ fn button(
     id: &'static str,
     label: &str,
     primary: bool,
-    cx: &mut Context<FilesView>,
-    f: impl Fn(&mut FilesView, &mut Context<FilesView>) + 'static,
+    cx: &mut Context<FilesWindow>,
+    f: impl Fn(&mut FilesWindow, &mut Context<FilesWindow>) + 'static,
 ) -> Stateful<Div> {
     div()
         .id(id)

@@ -949,6 +949,7 @@ name = "conchy-files"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
  "libc",
  "rayon",

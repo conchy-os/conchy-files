@@ -1,59 +1,68 @@
-//! Окно conchy-files: дерево папок, типы файлов и treemap, связанные выделением.
+//! Окно conchy-files в стиле Thunar: панель пути, боковая панель «Места»
+//! и «Устройства», список файлов и строка состояния.
 
 mod actions;
 mod dialogs;
 mod field;
+mod view;
 
-use std::cell::RefCell;
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use conchy_files::layout::{self, Cell, CellKind, HEADER_H};
-use conchy_files::model::{NodeId, Tree, human_size};
-use conchy_files::scan::{Progress, ScanOptions, scan};
-use conchy_files::ops::Mode;
-use conchy_files::treemap::Rect;
+use conchy_files::dir::{self, Entry, Sort, SortKey, TrashInfo};
+use conchy_files::model::human_size;
+use conchy_files::places::{self, Mount, Place, Target};
+use conchy_files::{icons, mime, trash, watch};
+use futures::StreamExt;
 use gpui::{
-    App, Bounds, ClickEvent, Context, ContentMask, FocusHandle, Hsla, KeyBinding, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, ScrollStrategy, SharedString, Task, TextRun, Timer,
-    UniformListScrollHandle, Window, actions, canvas, div, hsla, linear_color_stop, linear_gradient,
-    point, prelude::*, px, quad, relative, rgb,
-    size, uniform_list,
+    App, Context, FocusHandle, KeyBinding, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, NavigationDirection,
+    ScrollStrategy, Task, Timer, UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb,
 };
+
+use actions::{Clip, Job};
+use dialogs::{Dialog, Menu};
+use field::TextField;
 
 actions!(
     conchy_files,
     [
-        SelectNext, SelectPrev, Expand, Collapse, ZoomIn, ZoomOut, OpenItem, Rescan, Quit, CutFiles,
-        CopyFiles, PasteFiles, RenameItem, NewFolder, TrashFiles, DeleteFiles, Undo, CopyPath, Cancel
+        SelectNext, SelectPrev, ExtendNext, ExtendPrev, SelectFirst, SelectLast, PageDown, PageUp, OpenSelected,
+        GoBack, GoForward, GoUp, GoHome, EditLocation, ToggleHidden, Reload, CloseWindow, SelectAll, Escape,
+        CutFiles, CopyFiles, PasteFiles, RenameItem, NewFolder, TrashFiles, DeleteFiles, Undo
     ]
 );
 
 const CTX: &str = "FilesView";
-/// Пока открыт диалог, привязки окна не срабатывают: клавиши идут в поле ввода.
-const CTX_DIALOG: &str = "FilesDialog";
+/// Пока вводится текст (диалог или путь), привязки окна не срабатывают.
+const CTX_TEXT: &str = "FilesText";
 
+/// Клавиши Thunar 4.20.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("j", SelectNext, Some(CTX)),
         KeyBinding::new("down", SelectNext, Some(CTX)),
-        KeyBinding::new("k", SelectPrev, Some(CTX)),
         KeyBinding::new("up", SelectPrev, Some(CTX)),
-        KeyBinding::new("l", Expand, Some(CTX)),
-        KeyBinding::new("right", Expand, Some(CTX)),
-        KeyBinding::new("h", Collapse, Some(CTX)),
-        KeyBinding::new("left", Collapse, Some(CTX)),
-        KeyBinding::new("enter", ZoomIn, Some(CTX)),
-        KeyBinding::new("backspace", ZoomOut, Some(CTX)),
-        KeyBinding::new("o", OpenItem, Some(CTX)),
-        KeyBinding::new("f5", Rescan, Some(CTX)),
-        KeyBinding::new("q", Quit, Some(CTX)),
-        KeyBinding::new("ctrl-q", Quit, Some(CTX)),
-        // Клавиши Thunar.
+        KeyBinding::new("shift-down", ExtendNext, Some(CTX)),
+        KeyBinding::new("shift-up", ExtendPrev, Some(CTX)),
+        KeyBinding::new("home", SelectFirst, Some(CTX)),
+        KeyBinding::new("end", SelectLast, Some(CTX)),
+        KeyBinding::new("pagedown", PageDown, Some(CTX)),
+        KeyBinding::new("pageup", PageUp, Some(CTX)),
+        KeyBinding::new("enter", OpenSelected, Some(CTX)),
+        KeyBinding::new("backspace", GoBack, Some(CTX)),
+        KeyBinding::new("alt-left", GoBack, Some(CTX)),
+        KeyBinding::new("alt-right", GoForward, Some(CTX)),
+        KeyBinding::new("alt-up", GoUp, Some(CTX)),
+        KeyBinding::new("alt-home", GoHome, Some(CTX)),
+        KeyBinding::new("ctrl-l", EditLocation, Some(CTX)),
+        KeyBinding::new("alt-d", EditLocation, Some(CTX)),
+        KeyBinding::new("ctrl-h", ToggleHidden, Some(CTX)),
+        KeyBinding::new("f5", Reload, Some(CTX)),
+        KeyBinding::new("ctrl-r", Reload, Some(CTX)),
+        KeyBinding::new("ctrl-q", CloseWindow, Some(CTX)),
+        KeyBinding::new("ctrl-w", CloseWindow, Some(CTX)),
+        KeyBinding::new("ctrl-a", SelectAll, Some(CTX)),
+        KeyBinding::new("escape", Escape, Some(CTX)),
         KeyBinding::new("ctrl-x", CutFiles, Some(CTX)),
         KeyBinding::new("ctrl-c", CopyFiles, Some(CTX)),
         KeyBinding::new("ctrl-insert", CopyFiles, Some(CTX)),
@@ -64,8 +73,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", TrashFiles, Some(CTX)),
         KeyBinding::new("shift-delete", DeleteFiles, Some(CTX)),
         KeyBinding::new("ctrl-z", Undo, Some(CTX)),
-        KeyBinding::new("ctrl-shift-c", CopyPath, Some(CTX)),
-        KeyBinding::new("escape", Cancel, Some(CTX)),
     ]);
 }
 
@@ -77,90 +84,108 @@ const TEXT: u32 = 0xc0caf5;
 const DIM: u32 = 0x737aa2;
 const ACCENT: u32 = 0x7aa2f7;
 const SEL_BG: u32 = 0x2e3c64;
-/// Отмеченные Ctrl/Shift+кликом строки (выделенная строка остаётся ярче).
-const MARK_BG: u32 = 0x283457;
+const DANGER: u32 = 0xf7768e;
 
-/// Свой цвет у каждого типа файлов, как в WizTree. Оттенки идут по золотому сечению,
-/// поэтому соседние по размеру типы всегда заметно различаются.
-fn type_color(kind: Option<u16>) -> Hsla {
-    match kind {
-        Some(k) => {
-            let hue = (0.6 + k as f32 * 0.618_034) % 1.0;
-            let light = if k % 2 == 0 { 0.56 } else { 0.47 };
-            hsla(hue, 0.72, light, 1.0)
-        }
-        None => hsla(0.0, 0.0, 0.45, 1.0),
+/// Строка списка: запись и заранее подготовленные подписи (готовятся в фоне).
+pub(crate) struct Row {
+    pub entry: Entry,
+    pub icon: Option<PathBuf>,
+    pub kind: String,
+    pub size: String,
+    pub date: String,
+}
+
+impl AsRef<Entry> for Row {
+    fn as_ref(&self) -> &Entry {
+        &self.entry
     }
 }
 
-const ROW_H: f32 = 22.0;
-
-enum ScanState {
-    Idle,
-    Running { started: Instant, progress: Arc<Progress> },
-    Done { took: Duration, errors: u64 },
-    Failed(String),
-}
-
-pub struct FilesView {
-    root_path: PathBuf,
+pub struct FilesWindow {
     focus: FocusHandle,
-    tree: Option<Arc<Tree>>,
-    state: ScanState,
-    _scan_task: Option<Task<()>>,
+    location: Target,
+    back: Vec<Target>,
+    forward: Vec<Target>,
 
-    /// Видимые строки дерева: (узел, глубина).
-    rows: Vec<(NodeId, u16)>,
-    expanded: HashSet<NodeId>,
-    selected: NodeId,
-    tree_scroll: UniformListScrollHandle,
+    /// Всё содержимое папки (отсортировано) и индексы видимых строк (без скрытых).
+    rows: Vec<Row>,
+    visible: Vec<usize>,
+    sort: Sort,
+    show_hidden: bool,
+    loading: bool,
+    load_error: Option<String>,
+    load_gen: u64,
+    _load_task: Option<Task<()>>,
+    /// (всего, свободно) на разделе текущей папки.
+    space: Option<(u64, u64)>,
 
-    /// Корень, который сейчас показан на карте.
-    view_root: NodeId,
-    type_filter: Option<u16>,
-    hovered: Option<Cell>,
-    /// Последняя раскладка карты (заполняется при отрисовке, читается мышью).
-    cells: Rc<RefCell<MapCache>>,
-    /// Растёт при каждом изменении дерева, сбрасывает кеш раскладки.
-    tree_gen: usize,
+    /// Выделение по путям: переживает перечитывание папки.
+    selected: HashSet<PathBuf>,
+    cursor: Option<PathBuf>,
+    anchor: Option<PathBuf>,
+    list_scroll: UniformListScrollHandle,
+    typeahead: (String, Instant),
 
-    /// Несколько элементов, отмеченных Ctrl/Shift+кликом. Пусто — работаем с выделенным.
-    marked: HashSet<NodeId>,
-    clipboard: Option<actions::Clip>,
+    location_edit: Option<TextField>,
+    places: Vec<Place>,
+    mounts: Vec<Mount>,
+    /// Особые иконки XDG-папок (`folder-download` и т. п.).
+    special_icons: HashMap<PathBuf, String>,
+    _watch: Option<watch::Watch>,
+    title: String,
+
+    clipboard: Option<Clip>,
     undo: Vec<conchy_files::ops::Record>,
-    job: Option<actions::Job>,
-    dialog: Option<dialogs::Dialog>,
-    menu: Option<dialogs::Menu>,
-    /// Короткое сообщение справа в строке состояния.
+    job: Option<Job>,
+    dialog: Option<Dialog>,
+    menu: Option<Menu>,
     notice: Option<(String, Instant)>,
 }
 
-#[derive(Default)]
-struct MapCache {
-    key: Option<(NodeId, [i32; 4], usize)>,
-    cells: Vec<Cell>,
-}
-
-impl FilesView {
-    pub fn new(root_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+impl FilesWindow {
+    pub fn new(start: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window);
+        let special_icons = places::user_dirs()
+            .into_iter()
+            .map(|(_, p)| {
+                let icon = places::folder_icon(&p);
+                (p, icon)
+            })
+            .chain([(places::home(), "user-home".to_string())])
+            .collect();
+        let (location, select) = if start.is_dir() {
+            (Target::Dir(start), Vec::new())
+        } else {
+            // Передали файл — открываем его папку и выделяем его, как `thunar файл`.
+            let parent = start.parent().map(Path::to_path_buf).unwrap_or_else(places::home);
+            (Target::Dir(parent), vec![start])
+        };
         let mut this = Self {
-            root_path,
             focus,
-            tree: None,
-            state: ScanState::Idle,
-            _scan_task: None,
+            location: location.clone(),
+            back: Vec::new(),
+            forward: Vec::new(),
             rows: Vec::new(),
-            expanded: HashSet::new(),
-            selected: Tree::ROOT,
-            tree_scroll: UniformListScrollHandle::new(),
-            view_root: Tree::ROOT,
-            type_filter: None,
-            hovered: None,
-            cells: Rc::default(),
-            tree_gen: 0,
-            marked: HashSet::new(),
+            visible: Vec::new(),
+            sort: Sort::default(),
+            show_hidden: false,
+            loading: false,
+            load_error: None,
+            load_gen: 0,
+            _load_task: None,
+            space: None,
+            selected: HashSet::new(),
+            cursor: None,
+            anchor: None,
+            list_scroll: UniformListScrollHandle::new(),
+            typeahead: (String::new(), Instant::now()),
+            location_edit: None,
+            places: places::places(),
+            mounts: places::mounts(),
+            special_icons,
+            _watch: None,
+            title: String::new(),
             clipboard: None,
             undo: Vec::new(),
             job: None,
@@ -168,912 +193,601 @@ impl FilesView {
             menu: None,
             notice: None,
         };
-        this.start_scan(cx);
+        this.set_location(location, select, cx);
+        this.poll_mounts(cx);
         this
     }
 
-    // ---------- сканирование ----------
+    // ---------- загрузка ----------
 
-    fn start_scan(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.state, ScanState::Running { .. }) {
-            return;
+    /// Перечитывает текущее место в фоне. `select` — что выделить после загрузки.
+    fn load(&mut self, select: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.load_gen += 1;
+        let generation = self.load_gen;
+        self.loading = true;
+        let target = self.location.clone();
+        let tops: Vec<PathBuf> = self.mounts.iter().map(|m| m.mount_point.clone()).collect();
+        let sort = self.sort;
+        let special = self.special_icons.clone();
+        let job = cx.background_executor().spawn(async move { read_location(&target, &tops, sort, &special) });
+        self._load_task = Some(cx.spawn(async move |this, cx| {
+            let res = job.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.load_gen == generation {
+                    this.apply_load(res, select);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.load(Vec::new(), cx);
+    }
+
+    fn apply_load(&mut self, res: Result<Vec<Row>, String>, select: Vec<PathBuf>) {
+        self.loading = false;
+        match res {
+            Ok(rows) => {
+                self.rows = rows;
+                self.load_error = None;
+            }
+            Err(e) => {
+                self.rows.clear();
+                self.load_error = Some(e);
+            }
         }
-        let progress = Arc::new(Progress::default());
-        self.state = ScanState::Running { started: Instant::now(), progress: progress.clone() };
-        let root = self.root_path.clone();
-        let p = progress.clone();
-        let job = cx.background_executor().spawn(async move {
-            let t = Instant::now();
-            let res = scan(&root, &ScanOptions::default(), &p).map(Tree::from_raw);
-            (res, t.elapsed())
-        });
+        self.space = match &self.location {
+            Target::Dir(p) => places::statvfs(p),
+            Target::Trash => None,
+        };
+        self.rebuild_visible();
+        let present: HashSet<&Path> = self.visible.iter().map(|&i| self.rows[i].entry.path.as_path()).collect();
+        if !select.is_empty() {
+            self.selected = select.iter().filter(|p| present.contains(p.as_path())).cloned().collect();
+            let first = self.visible.iter().map(|&i| &self.rows[i].entry.path).find(|p| self.selected.contains(*p)).cloned();
+            if let Some(first) = first {
+                self.cursor = Some(first);
+                self.anchor = self.cursor.clone();
+                self.scroll_to_cursor();
+            }
+        } else {
+            self.selected.retain(|p| present.contains(p.as_path()));
+            if self.cursor.as_ref().is_some_and(|c| !present.contains(c.as_path())) {
+                self.cursor = None;
+            }
+        }
+    }
 
-        // Пока идёт обход, раз в 100 мс перерисовываем счётчики.
+    fn rebuild_visible(&mut self) {
+        let hidden = self.show_hidden;
+        self.visible = (0..self.rows.len()).filter(|&i| hidden || !self.rows[i].entry.is_hidden()).collect();
+    }
+
+    pub(crate) fn resort(&mut self, key: SortKey, cx: &mut Context<Self>) {
+        if self.sort.key == key {
+            self.sort.ascending = !self.sort.ascending;
+        } else {
+            self.sort.key = key;
+            self.sort.ascending = true;
+        }
+        dir::sort(&mut self.rows, self.sort);
+        self.rebuild_visible();
+        self.scroll_to_cursor();
+        cx.notify();
+    }
+
+    /// Раз в 2 секунды обновляет «Устройства» (флешку вставили или извлекли).
+    fn poll_mounts(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(Duration::from_millis(100)).await;
-                let running = this
+                Timer::after(Duration::from_secs(2)).await;
+                let mounts = cx.background_executor().spawn(async { places::mounts() }).await;
+                let alive = this
                     .update(cx, |this, cx| {
-                        cx.notify();
-                        matches!(this.state, ScanState::Running { .. })
+                        // Сравниваем с точностью до мегабайта, чтобы не перерисовывать из-за логов.
+                        let key = |m: &[Mount]| m.iter().map(|x| (x.device.clone(), x.free >> 20)).collect::<Vec<_>>();
+                        if key(&this.mounts) != key(&mounts) {
+                            this.mounts = mounts;
+                            cx.notify();
+                        }
                     })
-                    .unwrap_or(false);
-                if !running {
+                    .is_ok();
+                if !alive {
                     break;
                 }
             }
         })
         .detach();
-
-        self._scan_task = Some(cx.spawn(async move |this, cx| {
-            let (res, took) = job.await;
-            let errors = progress.errors.load(Ordering::Relaxed);
-            let _ = this.update(cx, |this, cx| {
-                match res {
-                    Ok(tree) => this.set_tree(tree, took, errors),
-                    Err(e) => this.state = ScanState::Failed(e.to_string()),
-                }
-                cx.notify();
-            });
-        }));
     }
 
-    fn set_tree(&mut self, tree: Tree, took: Duration, errors: u64) {
-        // Сохраняем путь выделения, чтобы после пересканирования вернуться туда же.
-        let old_path = self.tree.as_ref().map(|t| t.path(self.selected));
-        self.tree = Some(Arc::new(tree));
-        self.state = ScanState::Done { took, errors };
-        self.expanded.clear();
-        self.expanded.insert(Tree::ROOT);
-        self.view_root = Tree::ROOT;
-        self.selected = Tree::ROOT;
-        self.type_filter = None;
-        self.marked.clear();
-        self.invalidate_map();
-        if let Some(p) = old_path {
-            if let Some(id) = self.tree.as_ref().and_then(|t| t.find(&p)) {
-                self.reveal(id);
-            }
-        }
-        self.rebuild_rows();
-    }
+    // ---------- навигация ----------
 
-    fn invalidate_map(&mut self) {
-        self.tree_gen += 1;
-        self.hovered = None;
-        *self.cells.borrow_mut() = MapCache::default();
-    }
-
-    // ---------- дерево ----------
-
-    fn rebuild_rows(&mut self) {
-        self.rows.clear();
-        let Some(tree) = self.tree.clone() else { return };
-        let mut stack = vec![(Tree::ROOT, 0u16)];
-        while let Some((id, depth)) = stack.pop() {
-            self.rows.push((id, depth));
-            if self.expanded.contains(&id) {
-                for &c in tree.node(id).children.iter().rev() {
-                    stack.push((c, depth + 1));
-                }
-            }
-        }
-    }
-
-    fn selected_row(&self) -> Option<usize> {
-        self.rows.iter().position(|(id, _)| *id == self.selected)
-    }
-
-    /// Выделяет узел, раскрывает его родителей и прокручивает дерево к нему.
-    fn reveal(&mut self, id: NodeId) {
-        let Some(tree) = self.tree.clone() else { return };
-        for a in tree.ancestors(id) {
-            if a != id {
-                self.expanded.insert(a);
-            }
-        }
-        self.selected = id;
-        self.rebuild_rows();
-        if let Some(ix) = self.selected_row() {
-            self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Center);
-        }
-    }
-
-    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(ix) = self.selected_row() else { return };
-        let next = (ix as isize + delta).clamp(0, self.rows.len() as isize - 1) as usize;
-        self.selected = self.rows[next].0;
-        self.marked.clear();
-        self.tree_scroll.scroll_to_item(next, ScrollStrategy::Top);
-        cx.notify();
-    }
-
-    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection(1, cx);
-    }
-
-    fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selection(-1, cx);
-    }
-
-    fn expand(&mut self, _: &Expand, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(tree) = self.tree.clone() else { return };
-        let node = tree.node(self.selected);
-        if !node.is_dir || node.children.is_empty() {
+    pub(crate) fn navigate(&mut self, target: Target, cx: &mut Context<Self>) {
+        if target == self.location {
+            self.reload(cx);
             return;
         }
-        if self.expanded.insert(self.selected) {
-            self.rebuild_rows();
+        self.back.push(self.location.clone());
+        self.forward.clear();
+        self.set_location(target, Vec::new(), cx);
+    }
+
+    fn set_location(&mut self, target: Target, mut select: Vec<PathBuf>, cx: &mut Context<Self>) {
+        // Поднялись выше — выделяем папку, из которой пришли (как Thunar).
+        if select.is_empty() {
+            if let (Target::Dir(old), Target::Dir(new)) = (&self.location, &target) {
+                if let Some(child) = old.ancestors().find(|a| a.parent() == Some(new.as_path())) {
+                    select.push(child.to_path_buf());
+                }
+            }
+        }
+        self.location = target;
+        self.rows.clear();
+        self.visible.clear();
+        self.selected.clear();
+        self.cursor = None;
+        self.anchor = None;
+        self.location_edit = None;
+        self.menu = None;
+        self.load_error = None;
+        self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.start_watch(cx);
+        self.load(select, cx);
+        cx.notify();
+    }
+
+    fn start_watch(&mut self, cx: &mut Context<Self>) {
+        self._watch = None;
+        let dirs: Vec<PathBuf> = match &self.location {
+            Target::Dir(p) => vec![p.clone()],
+            Target::Trash => {
+                let home = std::env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| places::home().join(".local/share"))
+                    .join("Trash");
+                vec![home.join("files"), home.join("info")]
+            }
+        };
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let Ok(w) = watch::watch(&refs, move || {
+            let _ = tx.unbounded_send(());
+        }) else {
+            return;
+        };
+        self._watch = Some(w);
+        cx.spawn(async move |this, cx| {
+            while rx.next().await.is_some() {
+                if this.update(cx, |this, cx| this.reload(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn go_back(&mut self, _: &GoBack, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prev) = self.back.pop() {
+            self.forward.push(self.location.clone());
+            self.set_location(prev, Vec::new(), cx);
+        }
+    }
+
+    pub(crate) fn go_forward(&mut self, _: &GoForward, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(next) = self.forward.pop() {
+            self.back.push(self.location.clone());
+            self.set_location(next, Vec::new(), cx);
+        }
+    }
+
+    pub(crate) fn go_up(&mut self, _: &GoUp, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(parent) = self.current_dir().and_then(Path::parent) {
+            let parent = parent.to_path_buf();
+            self.navigate(Target::Dir(parent), cx);
+        }
+    }
+
+    pub(crate) fn go_home(&mut self, _: &GoHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.navigate(Target::Dir(places::home()), cx);
+    }
+
+    pub(crate) fn current_dir(&self) -> Option<&Path> {
+        match &self.location {
+            Target::Dir(p) => Some(p),
+            Target::Trash => None,
+        }
+    }
+
+    pub(crate) fn in_trash(&self) -> bool {
+        self.location == Target::Trash
+    }
+
+    /// Открывает строку: папку — в этом окне, файл — программой по умолчанию.
+    pub(crate) fn open_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.in_trash() {
+            return self.notice("Чтобы открыть файл из корзины, сначала восстановите его", cx);
+        }
+        let e = &self.rows[ix].entry;
+        if e.is_dir {
+            let p = e.path.clone();
+            self.navigate(Target::Dir(p), cx);
+        } else if e.broken {
+            let msg = format!("Ссылка «{}» никуда не ведёт", e.name);
+            self.notice(msg, cx);
         } else {
-            // Уже раскрыт — переходим к первому ребёнку.
-            self.move_selection(1, cx);
+            let _ = std::process::Command::new("xdg-open").arg(&e.path).spawn();
         }
-        cx.notify();
     }
 
-    fn collapse(&mut self, _: &Collapse, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(tree) = self.tree.clone() else { return };
-        if self.expanded.remove(&self.selected) && self.selected != Tree::ROOT {
-            self.rebuild_rows();
-        } else if let Some(p) = tree.node(self.selected).parent {
-            self.reveal(p);
+    fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.selected_rows();
+        // Среди выделенного есть папка — переходим в неё; иначе открываем все файлы.
+        if let Some(&dir_ix) = rows.iter().find(|&&i| self.rows[i].entry.is_dir) {
+            return self.open_row(dir_ix, cx);
         }
-        cx.notify();
+        for ix in rows {
+            self.open_row(ix, cx);
+        }
     }
 
-    /// Клик по элементу в дереве или на карте с учётом Ctrl (добавить/убрать)
-    /// и Shift (диапазон строк дерева), как в Thunar.
-    fn click_select(&mut self, id: NodeId, m: Modifiers) {
-        if m.control {
-            if self.marked.is_empty() && self.selected != Tree::ROOT {
-                self.marked.insert(self.selected);
+    // ---------- выделение ----------
+
+    /// Индексы `rows` выделенных строк в порядке показа.
+    pub(crate) fn selected_rows(&self) -> Vec<usize> {
+        self.visible.iter().copied().filter(|&i| self.selected.contains(&self.rows[i].entry.path)).collect()
+    }
+
+    fn cursor_pos(&self) -> Option<usize> {
+        let c = self.cursor.as_ref()?;
+        self.visible.iter().position(|&i| self.rows[i].entry.path == *c)
+    }
+
+    fn scroll_to_cursor(&mut self) {
+        if let Some(pos) = self.cursor_pos() {
+            self.list_scroll.scroll_to_item(pos, ScrollStrategy::Center);
+        }
+    }
+
+    /// Нажатие на строку `pos` (позиция в видимом списке) с учётом Ctrl и Shift.
+    pub(crate) fn click_row(&mut self, pos: usize, m: Modifiers) {
+        let path = self.rows[self.visible[pos]].entry.path.clone();
+        if m.shift {
+            self.select_range(pos);
+        } else if m.control {
+            if !self.selected.remove(&path) {
+                self.selected.insert(path.clone());
             }
-            if !self.marked.remove(&id) {
-                self.marked.insert(id);
-            }
-        } else if m.shift {
-            let pos = |x: NodeId| self.rows.iter().position(|(r, _)| *r == x);
-            if let (Some(a), Some(b)) = (pos(self.selected), pos(id)) {
-                let (a, b) = (a.min(b), a.max(b));
-                self.marked = self.rows[a..=b].iter().map(|(r, _)| *r).filter(|&r| r != Tree::ROOT).collect();
-            }
+            self.anchor = Some(path.clone());
         } else {
-            self.marked.clear();
+            self.selected.clear();
+            self.selected.insert(path.clone());
+            self.anchor = Some(path.clone());
         }
-        self.selected = id;
+        self.cursor = Some(path);
+        self.menu = None;
+        self.location_edit = None;
     }
 
-    fn toggle_row(&mut self, id: NodeId, cx: &mut Context<Self>) {
-        if !self.expanded.remove(&id) {
-            self.expanded.insert(id);
+    fn select_range(&mut self, to: usize) {
+        let from = self
+            .anchor
+            .as_ref()
+            .and_then(|a| self.visible.iter().position(|&i| self.rows[i].entry.path == *a))
+            .unwrap_or(to);
+        let (a, b) = (from.min(to), from.max(to));
+        self.selected = self.visible[a..=b].iter().map(|&i| self.rows[i].entry.path.clone()).collect();
+    }
+
+    fn move_cursor(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.visible.is_empty() {
+            return;
         }
-        self.selected = id;
-        self.rebuild_rows();
+        let last = self.visible.len() as isize - 1;
+        let pos = match self.cursor_pos() {
+            Some(p) => (p as isize).saturating_add(delta).clamp(0, last) as usize,
+            None if delta < 0 => last as usize,
+            None => 0,
+        };
+        let path = self.rows[self.visible[pos]].entry.path.clone();
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor.clone().unwrap_or_else(|| path.clone()));
+            }
+            self.select_range(pos);
+        } else {
+            self.selected.clear();
+            self.selected.insert(path.clone());
+            self.anchor = Some(path.clone());
+        }
+        self.cursor = Some(path);
+        self.list_scroll.scroll_to_item(pos, ScrollStrategy::Top);
         cx.notify();
     }
 
-    // ---------- карта ----------
-
-    fn zoom_to(&mut self, id: NodeId) {
-        let Some(tree) = self.tree.as_ref() else { return };
-        let node = tree.node(id);
-        self.view_root = if node.is_dir { id } else { node.parent.unwrap_or(Tree::ROOT) };
-        self.hovered = None;
-    }
-
-    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
-        self.zoom_to(self.selected);
+    /// Клавиши без привязок: ввод текста (диалог, путь) или поиск по первым буквам,
+    /// как в списке Thunar (набранное сбрасывается через секунду).
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog.is_some() {
+            return self.on_dialog_key(ev, window, cx);
+        }
+        if self.location_edit.is_some() {
+            return self.on_location_key(ev, cx);
+        }
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        let Some(ch) = ks.key_char.clone().filter(|c| !m.control && !m.alt && !m.platform && !c.chars().any(char::is_control))
+        else {
+            return;
+        };
+        if self.typeahead.1.elapsed() > Duration::from_secs(1) {
+            self.typeahead.0.clear();
+        }
+        if ch.trim().is_empty() && self.typeahead.0.is_empty() {
+            return;
+        }
+        self.typeahead.0.push_str(&ch);
+        self.typeahead.1 = Instant::now();
+        let prefix = self.typeahead.0.to_lowercase();
+        if let Some(pos) = self.visible.iter().position(|&i| self.rows[i].entry.name.to_lowercase().starts_with(&prefix)) {
+            self.click_row(pos, Modifiers::default());
+            self.list_scroll.scroll_to_item(pos, ScrollStrategy::Top);
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
-    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(p) = self.tree.as_ref().and_then(|t| t.node(self.view_root).parent) {
-            let from = self.view_root;
-            self.view_root = p;
-            self.reveal(from);
-            cx.notify();
+    // ---------- строка пути ----------
+
+    fn edit_location(&mut self, _: &EditLocation, _: &mut Window, cx: &mut Context<Self>) {
+        self.start_location_edit(cx);
+    }
+
+    pub(crate) fn start_location_edit(&mut self, cx: &mut Context<Self>) {
+        let text = match &self.location {
+            Target::Dir(p) => p.display().to_string(),
+            Target::Trash => "trash:///".into(),
+        };
+        let len = text.len();
+        self.location_edit = Some(TextField::new(text, 0..len));
+        cx.notify();
+    }
+
+    fn on_location_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        cx.stop_propagation();
+        match ks.key.as_str() {
+            "escape" => self.location_edit = None,
+            "enter" => {
+                let text = self.location_edit.take().map(|f| f.text).unwrap_or_default();
+                self.go_to_typed(text.trim(), cx);
+            }
+            "tab" => {
+                if let Some(f) = &mut self.location_edit {
+                    if let Some(done) = complete_path(&f.text) {
+                        let len = done.len();
+                        *f = TextField::new(done, len..len);
+                    }
+                }
+            }
+            _ => {
+                if let Some(f) = &mut self.location_edit {
+                    let m = &ks.modifiers;
+                    if (ks.key == "v" && m.control) || (ks.key == "insert" && m.shift) {
+                        if let Some(t) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                            f.insert(t.lines().next().unwrap_or(""));
+                        }
+                    } else {
+                        f.key(ks);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Переход по введённому адресу: папка, файл (открыть его папку и выделить), `~`, `trash:///`.
+    fn go_to_typed(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.starts_with("trash:") {
+            return self.navigate(Target::Trash, cx);
+        }
+        let text = text.strip_prefix("file://").unwrap_or(text);
+        if text.contains("://") {
+            return self.notice("Сетевые адреса будут на этапе 6 (sftp, smb через FUSE)", cx);
+        }
+        let path = match text.strip_prefix('~') {
+            Some(rest) => places::home().join(rest.trim_start_matches('/')),
+            None => match self.current_dir() {
+                Some(cur) if !text.starts_with('/') => cur.join(text),
+                _ => PathBuf::from(text),
+            },
+        };
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_dir() => self.navigate(Target::Dir(path), cx),
+            Ok(_) => {
+                let Some(parent) = path.parent().map(Path::to_path_buf) else { return };
+                if Target::Dir(parent.clone()) != self.location {
+                    self.back.push(self.location.clone());
+                    self.forward.clear();
+                }
+                self.set_location(Target::Dir(parent), vec![path], cx);
+            }
+            Err(_) => self.notice(format!("Не найдено: {}", path.display()), cx),
         }
     }
 
-    fn open_item(&mut self, _: &OpenItem, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_cmd(actions::Cmd::Open, cx);
-    }
+    // ---------- прочие действия ----------
 
-    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+    fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
         if self.menu.take().is_none() {
             if self.job.is_some() {
                 self.cancel_job();
             } else {
-                self.marked.clear();
+                self.selected.clear();
             }
         }
         cx.notify();
     }
 
-    fn rescan(&mut self, _: &Rescan, _: &mut Window, cx: &mut Context<Self>) {
-        self.start_scan(cx);
+    pub(crate) fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.selected = self.visible.iter().map(|&i| self.rows[i].entry.path.clone()).collect();
         cx.notify();
     }
 
-    fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        cx.quit();
+    pub(crate) fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
+        self.show_hidden = !self.show_hidden;
+        self.rebuild_visible();
+        let present: HashSet<PathBuf> = self.visible.iter().map(|&i| self.rows[i].entry.path.clone()).collect();
+        self.selected.retain(|p| present.contains(p));
+        self.scroll_to_cursor();
+        let state = if self.show_hidden { "показаны" } else { "скрыты" };
+        self.notice(format!("Скрытые файлы {state} (Ctrl+H)"), cx);
     }
 
-    fn cell_at(&self, pos: gpui::Point<Pixels>) -> Option<Cell> {
-        let cache = self.cells.borrow();
-        layout::hit(&cache.cells, f32::from(pos.x), f32::from(pos.y)).cloned()
-    }
-
-    fn on_map_mouse_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(cell) = self.cell_at(ev.position) else { return };
-        let id = match cell.kind {
-            CellKind::Node(id) => id,
-            CellKind::Others { parent, .. } => parent,
-        };
-        if ev.click_count >= 2 {
-            self.zoom_to(id);
-        }
-        self.reveal(id);
-        self.click_select(id, ev.modifiers);
-        cx.notify();
-    }
-
-    fn on_map_right_down(&mut self, ev: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(cell) = self.cell_at(ev.position) else { return };
-        let id = match cell.kind {
-            CellKind::Node(id) => id,
-            CellKind::Others { parent, .. } => parent,
-        };
-        self.reveal(id);
-        self.open_menu(id, ev.position, cx);
-    }
-
-    fn on_map_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let cell = self.cell_at(ev.position);
-        let same = match (&cell, &self.hovered) {
-            (Some(a), Some(b)) => a.rect == b.rect,
-            (None, None) => true,
-            _ => false,
-        };
-        if !same {
-            self.hovered = cell;
-            cx.notify();
+    pub(crate) fn location_title(&self) -> String {
+        match &self.location {
+            Target::Dir(p) if p.parent().is_none() => "Файловая система".into(),
+            Target::Dir(p) => places::display_name(p),
+            Target::Trash => "Корзина".into(),
         }
     }
 
-    // ---------- отрисовка ----------
-
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut crumbs = div().flex().items_center().gap_1().min_w_0().overflow_hidden();
-        if let Some(tree) = &self.tree {
-            for (i, id) in tree.ancestors(self.view_root).into_iter().enumerate() {
-                if i > 0 {
-                    crumbs = crumbs.child(div().text_color(rgb(DIM)).child("›"));
-                }
-                let name: SharedString = tree.node(id).name.to_string().into();
-                let current = id == self.view_root;
-                crumbs = crumbs.child(
-                    div()
-                        .id(("crumb", id as usize))
-                        .px_1()
-                        .rounded_sm()
-                        .whitespace_nowrap()
-                        .cursor_pointer()
-                        .text_color(rgb(if current { TEXT } else { ACCENT }))
-                        .hover(|s| s.bg(rgb(BORDER)))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.view_root = id;
-                            this.reveal(id);
-                            cx.notify();
-                        }))
-                        .child(name),
-                );
-            }
-        } else {
-            crumbs = crumbs.child(self.root_path.display().to_string());
+    fn update_title(&mut self, window: &mut Window) {
+        let title = format!("{} — conchy-files", self.location_title());
+        if title != self.title {
+            window.set_window_title(&title);
+            self.title = title;
         }
-
-        let status: String = match &self.state {
-            ScanState::Idle => String::new(),
-            ScanState::Running { started, progress } => format!(
-                "Сканирование… {} файлов · {} папок · {} · {:.1} с",
-                progress.files.load(Ordering::Relaxed),
-                progress.dirs.load(Ordering::Relaxed),
-                human_size(progress.bytes.load(Ordering::Relaxed)),
-                started.elapsed().as_secs_f32()
-            ),
-            ScanState::Done { took, errors } => {
-                let tree = self.tree.as_ref().unwrap();
-                let root = tree.node(Tree::ROOT);
-                let mut s = format!(
-                    "{} · на диске {} · {} файлов · за {:.2} с",
-                    human_size(root.size),
-                    human_size(root.alloc),
-                    root.files,
-                    took.as_secs_f32()
-                );
-                if *errors > 0 {
-                    s.push_str(&format!(" · нет доступа: {errors}"));
-                }
-                s
-            }
-            ScanState::Failed(e) => format!("Ошибка: {e}"),
-        };
-
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .px_3()
-            .h(px(36.))
-            .flex_shrink_0()
-            .bg(rgb(PANEL))
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .child(crumbs)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .flex_shrink_0()
-                    .child(div().text_color(rgb(DIM)).child(status))
-                    .child(
-                        div()
-                            .id("rescan")
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BORDER)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.start_scan(cx);
-                                cx.notify();
-                            }))
-                            .child("Пересканировать (F5)"),
-                    ),
-            )
-    }
-
-
-    fn render_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let head = div()
-            .flex()
-            .w_full()
-            .h(px(ROW_H))
-            .px_2()
-            .items_center()
-            .flex_shrink_0()
-            .text_color(rgb(DIM))
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .child(div().flex_1().min_w_0().child("Папка"))
-            .child(col(COL_PCT).child("% от папки"))
-            .child(col(COL_SIZE).justify_end().child("Размер"))
-            .child(col(COL_FILES).justify_end().child("Файлы"));
-
-        let list = uniform_list(
-            "tree",
-            self.rows.len(),
-            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                let Some(tree) = this.tree.clone() else { return Vec::new() };
-                let cut_paths: Option<HashSet<PathBuf>> = this
-                    .clipboard
-                    .as_ref()
-                    .filter(|c| c.mode == Mode::Move)
-                    .map(|c| c.paths.iter().cloned().collect());
-                range
-                    .map(|ix| {
-                        let (id, depth) = this.rows[ix];
-                        let n = tree.node(id);
-                        let share = tree.share_of_parent(id);
-                        let selected = id == this.selected;
-                        let marked = this.marked.contains(&id);
-                        let cut = cut_paths.as_ref().is_some_and(|c| c.contains(&tree.path(id)));
-                        let chevron = if !n.is_dir || n.children.is_empty() {
-                            ""
-                        } else if this.expanded.contains(&id) {
-                            "▾"
-                        } else {
-                            "▸"
-                        };
-                        div()
-                            .id(("row", ix))
-                            .flex()
-                            .w_full()
-                            .items_center()
-                            .h(px(ROW_H))
-                            .px_2()
-                            .cursor_pointer()
-                            .when(selected, |d| d.bg(rgb(SEL_BG)))
-                            .when(marked && !selected, |d| d.bg(rgb(MARK_BG)))
-                            .when(!selected && !marked, |d| d.hover(|s| s.bg(rgb(BORDER))))
-                            .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                                let m = ev.modifiers();
-                                if ev.click_count() >= 2 && !m.control && !m.shift {
-                                    this.zoom_to(id);
-                                    this.toggle_row(id, cx);
-                                } else {
-                                    this.click_select(id, m);
-                                    cx.notify();
-                                }
-                            }))
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, ev: &MouseDownEvent, _, cx| this.open_menu(id, ev.position, cx)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .items_center()
-                                    .overflow_hidden()
-                                    .pl(px(depth as f32 * 14.))
-                                    .child(
-                                        div()
-                                            .id(("chev", ix))
-                                            .w(px(14.))
-                                            .flex_shrink_0()
-                                            .text_color(rgb(DIM))
-                                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                cx.stop_propagation();
-                                                this.toggle_row(id, cx);
-                                            }))
-                                            .child(chevron),
-                                    )
-                                    .child(
-                                        div()
-                                            .size(px(9.))
-                                            .mr(px(6.))
-                                            .flex_shrink_0()
-                                            .rounded_sm()
-                                            .when(n.is_dir, |d| d.bg(rgb(0xe0af68)))
-                                            .when(!n.is_dir, |d| d.bg(type_color(n.kind))),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .when(!n.is_dir, |d| d.text_color(rgb(DIM)))
-                                            // Вырезанное показываем бледным, как Thunar.
-                                            .when(cut, |d| d.opacity(0.45))
-                                            .child(n.name.to_string()),
-                                    ),
-                            )
-                            .child(col(COL_PCT).child(share_bar(share)))
-                            .child(col(COL_SIZE).justify_end().child(human_size(n.size)))
-                            .child(
-                                col(COL_FILES)
-                                    .justify_end()
-                                    .text_color(rgb(DIM))
-                                    .child(if n.is_dir { n.files.to_string() } else { String::new() }),
-                            )
-                    })
-                    .collect()
-            }),
-        )
-        .track_scroll(self.tree_scroll.clone())
-        .flex_1()
-        .w_full();
-
-        div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .bg(rgb(BG))
-            .child(head)
-            .child(list)
-    }
-
-    fn render_types(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.tree.as_ref().map_or(0, |t| t.types.len());
-        let head = div()
-            .flex()
-            .w_full()
-            .h(px(ROW_H))
-            .px_2()
-            .items_center()
-            .flex_shrink_0()
-            .text_color(rgb(DIM))
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .child(div().flex_1().min_w_0().child("Тип файлов"))
-            .child(col(COL_PCT_SHORT).justify_end().child("%"))
-            .child(col(COL_SIZE).justify_end().child("Размер"))
-            .child(col(COL_FILES).justify_end().child("Файлы"));
-
-        let list = uniform_list(
-            "types",
-            count,
-            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                let Some(tree) = this.tree.clone() else { return Vec::new() };
-                let total = tree.node(Tree::ROOT).size.max(1) as f64;
-                range
-                    .map(|ix| {
-                        let t = &tree.types[ix];
-                        let k = ix as u16;
-                        let active = this.type_filter == Some(k);
-                        let label =
-                            if t.ext.is_empty() { "без расширения".to_string() } else { format!(".{}", t.ext) };
-                        div()
-                            .id(("type", ix))
-                            .flex()
-                            .w_full()
-                            .items_center()
-                            .h(px(ROW_H))
-                            .px_2()
-                            .cursor_pointer()
-                            .when(active, |d| d.bg(rgb(SEL_BG)))
-                            .when(!active, |d| d.hover(|s| s.bg(rgb(BORDER))))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.type_filter = if this.type_filter == Some(k) { None } else { Some(k) };
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .items_center()
-                                    .gap_2()
-                                    .overflow_hidden()
-                                    .child(div().size(px(10.)).flex_shrink_0().rounded_sm().bg(type_color(Some(k))))
-                                    .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(label)),
-                            )
-                            .child(
-                                col(COL_PCT_SHORT)
-                                    .justify_end()
-                                    .text_color(rgb(DIM))
-                                    .child(format!("{:.1}%", t.size as f64 / total * 100.0)),
-                            )
-                            .child(col(COL_SIZE).justify_end().child(human_size(t.size)))
-                            .child(col(COL_FILES).justify_end().text_color(rgb(DIM)).child(t.files.to_string()))
-                    })
-                    .collect()
-            }),
-        )
-        .flex_1()
-        .w_full();
-
-        div()
-            .flex()
-            .flex_col()
-            .w(relative(0.36))
-            .min_w(px(280.))
-            .flex_shrink_0()
-            .bg(rgb(BG))
-            .border_l_1()
-            .border_color(rgb(BORDER))
-            .child(head)
-            .child(list)
-    }
-
-    fn render_map(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tree = self.tree.clone();
-        let cache = self.cells.clone();
-        let view_root = self.view_root;
-        let selected = self.selected;
-        let marked = self.marked.clone();
-        let generation = self.tree_gen;
-        let filter = self.type_filter;
-        let hovered_rect = self.hovered.as_ref().map(|c| c.rect);
-
-        let map = canvas(
-            move |_, _, _| {},
-            move |bounds, _, window, cx| {
-                window.paint_quad(quad(bounds, px(0.), rgb(MAP_BG), px(0.), rgb(MAP_BG), Default::default()));
-                let Some(tree) = tree else { return };
-                let b = to_rect(bounds);
-                let key = (
-                    view_root,
-                    [b.x as i32, b.y as i32, b.w as i32, b.h as i32],
-                    generation,
-                );
-                let mut cache = cache.borrow_mut();
-                if cache.key != Some(key) {
-                    cache.cells = layout::layout(&tree, view_root, b.inset(1.0));
-                    cache.key = Some(key);
-                }
-                window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    for cell in &cache.cells {
-                        paint_cell(&tree, cell, selected, &marked, filter, hovered_rect, window, cx);
-                    }
-                });
-            },
-        )
-        .size_full();
-
-        div()
-            .id("map")
-            .flex_1()
-            .min_h_0()
-            .border_t_1()
-            .border_color(rgb(BORDER))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_map_mouse_down))
-            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_map_right_down))
-            .on_mouse_move(cx.listener(Self::on_map_mouse_move))
-            .child(map)
-    }
-
-    /// Одна строка состояния снизу: что под курсором или что выделено.
-    fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let text: String = match &self.tree {
-            None => String::new(),
-            Some(tree) => {
-                let describe = |id: NodeId| {
-                    let n = tree.node(id);
-                    let mut s = format!(
-                        "{}  ·  {}  ·  {:.1}% от папки",
-                        tree.path(id).display(),
-                        human_size(n.size),
-                        tree.share_of_parent(id) * 100.0
-                    );
-                    if n.is_dir {
-                        s.push_str(&format!("  ·  {} файлов", n.files));
-                    }
-                    s
-                };
-                match self.hovered.as_ref().map(|c| &c.kind) {
-                    Some(CellKind::Node(id)) => describe(*id),
-                    Some(CellKind::Others { parent, count, size }) => format!(
-                        "{}  ·  ещё {} мелких элементов  ·  {}",
-                        tree.path(*parent).display(),
-                        count,
-                        human_size(*size)
-                    ),
-                    None if self.marked.len() > 1 => {
-                        let (size, files) = self.targets().iter().fold((0u64, 0u64), |(s, f), &id| {
-                            let n = tree.node(id);
-                            (s + n.size, f + n.files)
-                        });
-                        format!("Отмечено: {}  ·  {}  ·  {} файлов", self.marked.len(), human_size(size), files)
-                    }
-                    None => describe(self.selected),
-                }
-            }
-        };
-
-        // Справа: идущая операция с прогрессом и отменой или короткое сообщение.
-        let right = if let Some(job) = &self.job {
-            let p = &job.progress;
-            let frac = p.fraction();
-            let current = p.current.lock().map(|c| conchy_files::ops::display_name(&c)).unwrap_or_default();
-            let secs = job.started.elapsed().as_secs_f32();
-            Some(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .text_color(rgb(TEXT))
-                    .child(format!("{}… {:.0}%", job.title, frac * 100.0))
-                    .child(
-                        div()
-                            .relative()
-                            .w(px(120.))
-                            .h(px(6.))
-                            .rounded_sm()
-                            .bg(rgb(BORDER))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .h_full()
-                                    .rounded_sm()
-                                    .bg(rgb(ACCENT))
-                                    .w(px(120. * frac)),
-                            ),
-                    )
-                    .child(div().max_w(px(220.)).overflow_hidden().text_ellipsis().text_color(rgb(DIM)).child(current))
-                    .child(div().text_color(rgb(DIM)).child(format!("{secs:.0} с")))
-                    .child(
-                        div()
-                            .id("cancel-job")
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BORDER)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.cancel_job();
-                                cx.notify();
-                            }))
-                            .child("✕ Esc"),
-                    )
-                    .into_any_element(),
-            )
-        } else {
-            self.current_notice()
-                .map(|n| div().flex_shrink_0().text_color(rgb(ACCENT)).child(n.to_string()).into_any_element())
-        };
-
-        div()
-            .h(px(22.))
-            .px_3()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .flex_shrink_0()
-            .bg(rgb(PANEL))
-            .border_t_1()
-            .border_color(rgb(BORDER))
-            .text_color(rgb(DIM))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(div().min_w_0().overflow_hidden().text_ellipsis().child(text))
-            .children(right)
     }
 }
 
-const COL_PCT: f32 = 120.0;
-const COL_PCT_SHORT: f32 = 56.0;
-const COL_SIZE: f32 = 84.0;
-const COL_FILES: f32 = 72.0;
-const MAP_BG: u32 = 0x101018;
-
-/// Колонка фиксированной ширины: заголовок и строки используют одну и ту же функцию,
-/// поэтому значения всегда стоят ровно под своими заголовками.
-fn col(w: f32) -> gpui::Div {
-    div().w(px(w)).flex_shrink_0().flex().items_center().pl_2().whitespace_nowrap()
-}
-
-/// Полоска «% от папки» с числом поверх, как в WizTree.
-fn share_bar(share: f64) -> impl IntoElement {
-    let w = COL_PCT - 12.0;
-    div()
-        .relative()
-        .w(px(w))
-        .h(px(15.))
-        .rounded_sm()
-        .bg(rgb(BORDER))
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .h_full()
-                .rounded_sm()
-                .bg(rgb(0x3d59a1))
-                .w(px((share.clamp(0.0, 1.0) * w as f64) as f32)),
-        )
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(format!("{:.1}%", share * 100.0)),
-        )
-}
-
-fn to_rect(b: Bounds<Pixels>) -> Rect {
-    Rect::new(
-        f32::from(b.origin.x),
-        f32::from(b.origin.y),
-        f32::from(b.size.width),
-        f32::from(b.size.height),
-    )
-}
-
-fn to_bounds(r: Rect) -> Bounds<Pixels> {
-    Bounds { origin: point(px(r.x), px(r.y)), size: size(px(r.w), px(r.h)) }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_cell(
-    tree: &Tree,
-    cell: &Cell,
-    selected: NodeId,
-    marked: &HashSet<NodeId>,
-    filter: Option<u16>,
-    hovered: Option<Rect>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let r = cell.rect;
-    let is_hover = hovered == Some(r);
-    let is_selected = matches!(cell.kind, CellKind::Node(id) if id == selected || marked.contains(&id));
-    let outline: Hsla = hsla(0.0, 0.0, 0.0, 0.55);
-
-    let (label, is_dir) = match cell.kind {
-        CellKind::Node(id) => {
-            let n = tree.node(id);
-            let suffix = if n.is_dir { "\\" } else { "" };
-            (format!("{}{} ({})", n.name, suffix, human_size(n.size)), n.is_dir)
-        }
-        CellKind::Others { count, size, .. } => (format!("ещё {count} ({})", human_size(size)), false),
+/// Читает папку или корзину и готовит строки (в фоне).
+fn read_location(target: &Target, tops: &[PathBuf], sort: Sort, special: &HashMap<PathBuf, String>) -> Result<Vec<Row>, String> {
+    let entries = match target {
+        Target::Dir(p) => dir::list(p).map_err(|e| match e.kind() {
+            std::io::ErrorKind::PermissionDenied => "Нет доступа к этой папке".to_string(),
+            std::io::ErrorKind::NotFound => "Папка не существует".to_string(),
+            _ => e.to_string(),
+        })?,
+        Target::Trash => trash::list(tops)
+            .into_iter()
+            .filter_map(|l| {
+                let mut e = Entry::from_path(&l.item.file).ok()?;
+                e.name = places::display_name(&l.item.original);
+                e.mime = mime::db().guess(&l.item.file, &e.name, e.is_dir);
+                e.trash = Some(TrashInfo { original: l.item.original, deleted: l.deleted, info: l.item.info });
+                Some(e)
+            })
+            .collect(),
     };
+    let now = unsafe { libc::time(std::ptr::null_mut()) } as i64;
+    let db = mime::db();
+    let mut rows: Vec<Row> = entries
+        .into_iter()
+        .map(|e| {
+            let names: Vec<String> = match special.get(&e.path) {
+                Some(icon) if e.is_dir => vec![icon.clone(), "folder".into()],
+                _ if e.is_dir => vec!["folder".into()],
+                _ => db.icon_names(&e.mime),
+            };
+            let icon = icons::icons().lookup(&names, 16);
+            let kind = match &e.trash {
+                Some(t) => t.original.parent().map(|p| p.display().to_string()).unwrap_or_default(),
+                None if e.broken => "Битая ссылка".into(),
+                None if e.is_symlink => format!("Ссылка: {}", db.describe(&e.mime)),
+                None => db.describe(&e.mime),
+            };
+            let size = match e.items {
+                Some(n) if e.is_dir => items_label(n),
+                _ if e.is_dir => "—".into(),
+                _ => human_size(e.size),
+            };
+            let date = match &e.trash {
+                Some(t) if t.deleted > 0 => dir::format_date(t.deleted, now),
+                Some(_) => "—".into(),
+                None => dir::format_date(e.mtime, now),
+            };
+            Row { entry: e, icon, kind, size, date }
+        })
+        .collect();
+    dir::sort(&mut rows, sort);
+    Ok(rows)
+}
 
-    if is_dir {
-        // Папка: только тонкая рамка и подпись, цвет дают файлы внутри.
-        let header = hsla(0.0, 0.0, 1.0, if is_hover { 0.10 } else { 0.04 });
-        window.paint_quad(quad(to_bounds(r), px(0.), header, px(1.), outline, Default::default()));
-    } else {
-        // Файл: «подушка» — градиент от светлого верхнего левого угла к тёмному нижнему правому.
-        let base = match cell.kind {
-            CellKind::Node(id) => {
-                let n = tree.node(id);
-                let c = type_color(n.kind);
-                if filter.is_some() && filter != n.kind { c.opacity(0.15) } else { c }
-            }
-            CellKind::Others { .. } => hsla(0.0, 0.0, 0.35, 1.0),
-        };
-        let base = if is_hover { base.blend(hsla(0.0, 0.0, 1.0, 0.25)) } else { base };
-        let light = Hsla { l: (base.l + 0.16).min(0.92), ..base };
-        let dark = Hsla { l: (base.l - 0.20).max(0.05), ..base };
-        let fill = linear_gradient(135., linear_color_stop(light, 0.0), linear_color_stop(dark, 1.0));
-        window.paint_quad(quad(to_bounds(r), px(0.), fill, px(1.), outline, Default::default()));
-    }
-    if is_selected {
-        window.paint_quad(quad(to_bounds(r), px(0.), hsla(0.0, 0.0, 0.0, 0.0), px(2.), rgb(0xffffff), Default::default()));
-    }
-
-    let show = if is_dir { r.h > 40.0 && r.w > 50.0 } else { r.w > 40.0 && r.h > 15.0 };
-    if !show {
-        return;
-    }
-    let max_chars = ((r.w - 8.0) / 6.0).max(0.0) as usize;
-    let text = truncate(&label, max_chars);
-    if text.is_empty() {
-        return;
-    }
-    let color: Hsla = if is_dir { rgb(0xe6e9f5).into() } else { hsla(0.0, 0.0, 0.05, 0.9) };
-    let run = TextRun {
-        len: text.len(),
-        font: window.text_style().font(),
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
+/// «1 элемент», «3 элемента», «7 элементов».
+pub(crate) fn items_label(n: u64) -> String {
+    let word = match (n % 10, n % 100) {
+        (_, 11..=14) => "элементов",
+        (1, _) => "элемент",
+        (2..=4, _) => "элемента",
+        _ => "элементов",
     };
-    let line = window.text_system().shape_line(text.into(), px(11.), &[run], None);
-    let clip = to_bounds(r.inset(1.0));
-    window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
-        let _ = line.paint(point(px(r.x + 3.0), px(r.y)), px(HEADER_H), window, cx);
+    format!("{n} {word}")
+}
+
+/// Дополнение пути по Tab: общее начало подходящих имён в папке.
+fn complete_path(text: &str) -> Option<String> {
+    let expanded = match text.strip_prefix('~') {
+        Some(rest) => format!("{}{}", places::home().display(), rest),
+        None => text.to_string(),
+    };
+    let i = expanded.rfind('/')?;
+    let (dir, prefix) = (&expanded[..=i], &expanded[i + 1..]);
+    let mut names: Vec<(String, bool)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            // Скрытые предлагаем, только если пользователь сам начал с точки.
+            let ok = n.starts_with(prefix) && (prefix.starts_with('.') || !n.starts_with('.'));
+            ok.then(|| (n, e.path().is_dir()))
+        })
+        .collect();
+    names.sort();
+    let first = names.first()?.0.clone();
+    let common: String = names.iter().fold(first, |acc, (n, _)| {
+        acc.chars().zip(n.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a).collect()
     });
+    let mut out = format!("{dir}{common}");
+    if names.len() == 1 && names[0].1 {
+        out.push('/');
+    }
+    (out != expanded).then_some(out)
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    if max_chars < 4 {
-        return String::new();
-    }
-    let mut t: String = s.chars().take(max_chars - 1).collect();
-    t.push('…');
-    t
-}
-
-impl Render for FilesView {
+impl Render for FilesWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dialog = self.render_dialog(cx);
+        self.update_title(window);
+        let typing = self.dialog.is_some() || self.location_edit.is_some();
         let menu = self.render_menu(window, cx);
+        let dialog = self.render_dialog(cx);
         div()
-            .key_context(if self.dialog.is_some() { CTX_DIALOG } else { CTX })
+            .key_context(if typing { CTX_TEXT } else { CTX })
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::on_dialog_key))
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::select_prev))
-            .on_action(cx.listener(Self::expand))
-            .on_action(cx.listener(Self::collapse))
-            .on_action(cx.listener(Self::zoom_in))
-            .on_action(cx.listener(Self::zoom_out))
-            .on_action(cx.listener(Self::open_item))
-            .on_action(cx.listener(Self::rescan))
-            .on_action(cx.listener(Self::quit))
-            .on_action(cx.listener(Self::cancel))
+            .on_key_down(cx.listener(Self::on_key))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(1, false, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_cursor(-1, false, cx)))
+            .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.move_cursor(1, true, cx)))
+            .on_action(cx.listener(|this, _: &ExtendPrev, _, cx| this.move_cursor(-1, true, cx)))
+            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.move_cursor(isize::MIN, false, cx)))
+            .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.move_cursor(isize::MAX, false, cx)))
+            .on_action(cx.listener(|this, _: &PageDown, _, cx| this.move_cursor(15, false, cx)))
+            .on_action(cx.listener(|this, _: &PageUp, _, cx| this.move_cursor(-15, false, cx)))
+            .on_action(cx.listener(Self::open_selected))
+            .on_action(cx.listener(Self::go_back))
+            .on_action(cx.listener(Self::go_forward))
+            .on_action(cx.listener(Self::go_up))
+            .on_action(cx.listener(Self::go_home))
+            .on_action(cx.listener(Self::edit_location))
+            .on_action(cx.listener(|this, _: &ToggleHidden, _, cx| this.toggle_hidden(cx)))
+            .on_action(cx.listener(|this, _: &Reload, _, cx| {
+                this.places = places::places();
+                this.mounts = places::mounts();
+                this.reload(cx);
+            }))
+            .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
+            .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(|this, _: &CutFiles, _, cx| this.run_cmd(actions::Cmd::Cut, cx)))
             .on_action(cx.listener(|this, _: &CopyFiles, _, cx| this.run_cmd(actions::Cmd::Copy, cx)))
             .on_action(cx.listener(|this, _: &PasteFiles, _, cx| this.run_cmd(actions::Cmd::Paste, cx)))
@@ -1082,25 +796,56 @@ impl Render for FilesView {
             .on_action(cx.listener(|this, _: &TrashFiles, _, cx| this.run_cmd(actions::Cmd::Trash, cx)))
             .on_action(cx.listener(|this, _: &DeleteFiles, _, cx| this.run_cmd(actions::Cmd::Delete, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.run_cmd(actions::Cmd::Undo, cx)))
-            .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.run_cmd(actions::Cmd::CopyPath, cx)))
+            // Боковые кнопки мыши «назад» и «вперёд».
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _: &MouseDownEvent, w, cx| this.go_back(&GoBack, w, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _: &MouseDownEvent, w, cx| this.go_forward(&GoForward, w, cx)),
+            )
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .text_xs()
-            .child(self.render_header(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_tree(cx))
-                    .child(self.render_types(cx)),
-            )
-            .child(self.render_map(cx))
+            .text_size(px(13.))
+            .child(self.render_toolbar(cx))
+            .child(div().flex().flex_1().min_h_0().child(self.render_sidebar(cx)).child(self.render_list(cx)))
             .child(self.render_status(cx))
             .children(menu)
             .children(dialog)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn russian_plurals() {
+        assert_eq!(items_label(1), "1 элемент");
+        assert_eq!(items_label(3), "3 элемента");
+        assert_eq!(items_label(11), "11 элементов");
+        assert_eq!(items_label(12), "12 элементов");
+        assert_eq!(items_label(22), "22 элемента");
+        assert_eq!(items_label(21), "21 элемент");
+        assert_eq!(items_label(0), "0 элементов");
+    }
+
+    #[test]
+    fn completes_paths() {
+        let d = std::env::temp_dir().join(format!("conchy-complete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("Документы")).unwrap();
+        std::fs::create_dir_all(d.join("Довольно")).unwrap();
+        std::fs::write(d.join("Музыка.txt"), "").unwrap();
+        let base = d.display().to_string();
+        assert_eq!(complete_path(&format!("{base}/Док")), Some(format!("{base}/Документы/")));
+        assert_eq!(complete_path(&format!("{base}/Д")), Some(format!("{base}/До")));
+        assert_eq!(complete_path(&format!("{base}/Му")), Some(format!("{base}/Музыка.txt")));
+        assert_eq!(complete_path(&format!("{base}/Я")), None);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

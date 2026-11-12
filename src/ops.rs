@@ -626,6 +626,48 @@ pub fn delete_all(paths: &[PathBuf], progress: &JobProgress) -> Outcome {
     out
 }
 
+/// Возвращает файлы из корзины на прежние места (пункт «Восстановить»).
+/// Отменяется как обычное удаление в корзину не будет: запись не создаётся.
+pub fn restore_all(items: &[TrashedItem], progress: &JobProgress) -> Outcome {
+    let mut out = Outcome::default();
+    progress.total_items.store(items.len() as u64, Ordering::Relaxed);
+    for item in items {
+        if progress.is_cancelled() {
+            out.cancelled = true;
+            break;
+        }
+        progress.set_current(&item.original);
+        match trash::restore(item) {
+            Ok(()) => {
+                out.touch(&item.original);
+                out.touch(&item.file);
+            }
+            Err(e) => out.error(&item.original, e),
+        }
+        progress.item_done();
+    }
+    out
+}
+
+/// Удаляет из корзины насовсем (в том числе «Очистить корзину»).
+pub fn erase_all(items: &[TrashedItem], progress: &JobProgress) -> Outcome {
+    let mut out = Outcome::default();
+    progress.total_items.store(items.len() as u64, Ordering::Relaxed);
+    for item in items {
+        if progress.is_cancelled() {
+            out.cancelled = true;
+            break;
+        }
+        progress.set_current(&item.original);
+        match trash::erase(item) {
+            Ok(()) => out.touch(&item.file),
+            Err(e) => out.error(&item.original, e),
+        }
+        progress.item_done();
+    }
+    out
+}
+
 // ---------- отмена ----------
 
 /// Выполняет обратную операцию.

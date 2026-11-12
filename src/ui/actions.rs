@@ -1,8 +1,9 @@
-//! Команды над файлами (буфер обмена, переименование, корзина, отмена)
-//! и их выполнение в фоне с обновлением дерева.
+//! Команды над файлами (буфер обмена, переименование, корзина, отмена),
+//! контекстные меню и выполнение операций в фоне.
 //!
 //! Одновременно идёт одна операция. Конфликты имён из фонового потока приходят
-//! через канал и показываются диалогом; поток ждёт ответа.
+//! через канал и показываются диалогом; поток ждёт ответа. После операции папка
+//! перечитывается, новое выделяется (как в Thunar после вставки).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,13 +11,14 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use conchy_files::model::{NodeId, Tree, human_size};
+use conchy_files::model::human_size;
 use conchy_files::ops::{self, Answer, Asker, Conflict, JobProgress, Mode, Outcome, Record, Resolution};
-use conchy_files::scan::{Progress, RawNode, ScanOptions, scan};
-use gpui::{ClipboardItem, Context, Task, Timer};
+use conchy_files::places::Target;
+use conchy_files::trash::TrashedItem;
+use gpui::{ClipboardItem, Context, Pixels, Point, Task, Timer};
 
-use super::FilesView;
-use super::dialogs::{Dialog, NamePurpose};
+use super::FilesWindow;
+use super::dialogs::{ConfirmAction, Dialog, Menu, MenuItem, NamePurpose};
 use super::field::TextField;
 
 const UNDO_LIMIT: usize = 100;
@@ -26,16 +28,23 @@ const NOTICE_TTL: Duration = Duration::from_secs(4);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Cmd {
     Open,
+    OpenTerminal,
     Cut,
     Copy,
     Paste,
+    /// Вставить внутрь выделенной папки.
+    PasteInto,
     Rename,
     NewFolder,
     NewFile,
     Trash,
     Delete,
+    Restore,
+    EmptyTrash,
     Undo,
     CopyPath,
+    ToggleHidden,
+    SelectAll,
 }
 
 /// Что лежит в буфере обмена приложения.
@@ -57,7 +66,6 @@ pub(super) struct ConflictRequest {
 pub(super) struct Job {
     pub title: String,
     pub progress: Arc<JobProgress>,
-    pub started: Instant,
     conflicts: mpsc::Receiver<ConflictRequest>,
     _task: Task<()>,
 }
@@ -69,6 +77,8 @@ pub(super) enum JobKind {
     Paste { cut: bool },
     /// Отмена этой записи; сама в историю не попадает.
     Undo(Record),
+    /// Операция в корзине: в историю не попадает.
+    NoUndo,
 }
 
 struct UiAsker(mpsc::Sender<ConflictRequest>);
@@ -91,7 +101,7 @@ fn describe(path: &Path) -> String {
     let Ok(meta) = fs::symlink_metadata(path) else { return String::new() };
     let what = if meta.is_dir() {
         let n = fs::read_dir(path).map(|d| d.count()).unwrap_or(0);
-        format!("Папка, элементов: {n}")
+        format!("Папка, {}", super::items_label(n as u64))
     } else if meta.file_type().is_symlink() {
         let target = fs::read_link(path).map(|t| t.display().to_string()).unwrap_or_default();
         format!("Ссылка → {target}")
@@ -101,22 +111,27 @@ fn describe(path: &Path) -> String {
     format!("{what}  ·  Изменён: {}", ops::format_mtime(&meta))
 }
 
-impl FilesView {
+impl FilesWindow {
     pub(super) fn run_cmd(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
         self.menu = None;
-        if self.tree.is_none() {
-            return;
-        }
+        let trash = self.in_trash();
         match cmd {
             Cmd::Open => {
-                if let Some(tree) = &self.tree {
-                    let _ = std::process::Command::new("xdg-open").arg(tree.path(self.selected)).spawn();
+                let rows = self.selected_rows();
+                if let Some(&ix) = rows.iter().find(|&&i| self.rows[i].entry.is_dir) {
+                    self.open_row(ix, cx);
+                } else {
+                    for ix in rows {
+                        self.open_row(ix, cx);
+                    }
                 }
             }
+            Cmd::OpenTerminal => self.open_terminal(cx),
+            Cmd::Cut | Cmd::Copy if trash => self.notice("Из корзины файлы можно только восстановить", cx),
             Cmd::Cut | Cmd::Copy => {
                 let paths = self.target_paths();
                 if paths.is_empty() {
-                    return self.notice("Нечего копировать", cx);
+                    return self.notice("Ничего не выделено", cx);
                 }
                 let mode = if cmd == Cmd::Cut { Mode::Move } else { Mode::Copy };
                 cx.write_to_clipboard(ClipboardItem::new_string(join_paths(&paths)));
@@ -124,25 +139,39 @@ impl FilesView {
                 self.notice(format!("{verb} в буфер: {}", count_label(&paths)), cx);
                 self.clipboard = Some(Clip { mode, paths });
             }
-            Cmd::Paste => self.paste(cx),
-            Cmd::Rename => {
-                let targets = self.targets();
-                let [id] = targets[..] else {
-                    return self.notice("Переименовать можно только один элемент", cx);
+            Cmd::Paste | Cmd::PasteInto => {
+                let dest = if cmd == Cmd::PasteInto {
+                    let rows = self.selected_rows();
+                    match rows[..] {
+                        [ix] if self.rows[ix].entry.is_dir => Some(self.rows[ix].entry.path.clone()),
+                        _ => None,
+                    }
+                } else {
+                    self.current_dir().map(Path::to_path_buf)
                 };
-                let tree = self.tree.as_ref().unwrap();
-                let n = tree.node(id);
+                match dest {
+                    Some(d) => self.paste(d, cx),
+                    None => self.notice("Сюда вставить нельзя", cx),
+                }
+            }
+            Cmd::Rename if trash => {}
+            Cmd::Rename => {
+                let rows = self.selected_rows();
+                let [ix] = rows[..] else {
+                    return self.notice("Выделите один элемент, чтобы переименовать", cx);
+                };
+                let e = &self.rows[ix].entry;
                 // Как в Thunar: выделено имя без расширения.
-                let base = ops::split_ext(n.name.as_bytes(), n.is_dir).0.len();
+                let base = ops::split_ext(e.name.as_bytes(), e.is_dir).0.len();
                 self.dialog = Some(Dialog::Name {
-                    purpose: NamePurpose::Rename(tree.path(id)),
-                    field: TextField::new(n.name.to_string(), 0..base),
+                    purpose: NamePurpose::Rename(e.path.clone()),
+                    field: TextField::new(e.name.clone(), 0..base),
                     error: None,
                 });
             }
             Cmd::NewFolder | Cmd::NewFile => {
+                let Some(parent) = self.current_dir().map(Path::to_path_buf) else { return };
                 let is_dir = cmd == Cmd::NewFolder;
-                let (_, parent) = self.dest_dir();
                 let default = if is_dir { "Новая папка" } else { "Новый файл" };
                 let name = ops::next_new_name(&parent, default, is_dir);
                 let len = name.len();
@@ -152,18 +181,56 @@ impl FilesView {
                     error: None,
                 });
             }
+            // В корзине Delete значит «удалить насовсем».
+            Cmd::Trash if trash => self.run_cmd(Cmd::Delete, cx),
             Cmd::Trash => {
                 let paths = self.target_paths();
-                if paths.is_empty() {
-                    return;
+                if !paths.is_empty() {
+                    self.run_job("Перемещение в корзину", JobKind::Normal, cx, move |p, _| ops::trash_all(&paths, p));
                 }
-                self.run_job("Перемещение в корзину", JobKind::Normal, cx, move |p, _| ops::trash_all(&paths, p));
             }
             Cmd::Delete => {
-                let paths = self.target_paths();
-                if !paths.is_empty() {
-                    self.dialog = Some(Dialog::ConfirmDelete { paths });
+                if trash {
+                    let items = self.trash_items(true);
+                    if !items.is_empty() {
+                        let title = delete_title(items.len(), self.selected_name());
+                        self.dialog = Some(Dialog::Confirm {
+                            title,
+                            body: "Элементы будут удалены из корзины, восстановить их будет нельзя.".into(),
+                            ok: "Удалить",
+                            action: ConfirmAction::Erase(items),
+                        });
+                    }
+                } else {
+                    let paths = self.target_paths();
+                    if !paths.is_empty() {
+                        let title = delete_title(paths.len(), self.selected_name());
+                        self.dialog = Some(Dialog::Confirm {
+                            title,
+                            body: "Элементы не попадут в корзину, восстановить их будет нельзя.".into(),
+                            ok: "Удалить",
+                            action: ConfirmAction::Delete(paths),
+                        });
+                    }
                 }
+            }
+            Cmd::Restore => {
+                let items = self.trash_items(true);
+                if !items.is_empty() {
+                    self.run_job("Восстановление", JobKind::NoUndo, cx, move |p, _| ops::restore_all(&items, p));
+                }
+            }
+            Cmd::EmptyTrash => {
+                let items = self.trash_items(false);
+                if items.is_empty() {
+                    return self.notice("Корзина уже пуста", cx);
+                }
+                self.dialog = Some(Dialog::Confirm {
+                    title: "Удалить всё из корзины?".into(),
+                    body: format!("{} будут удалены насовсем.", super::items_label(items.len() as u64)),
+                    ok: "Очистить корзину",
+                    action: ConfirmAction::Erase(items),
+                });
             }
             Cmd::Undo => {
                 if self.job.is_some() {
@@ -177,69 +244,144 @@ impl FilesView {
                 self.run_job(title, JobKind::Undo(rec), cx, move |p, _| ops::undo(&r, p));
             }
             Cmd::CopyPath => {
-                let paths = self.target_paths();
+                let paths: Vec<PathBuf> = if trash {
+                    self.selected_rows().iter().filter_map(|&i| self.rows[i].entry.trash.as_ref().map(|t| t.original.clone())).collect()
+                } else {
+                    self.target_paths()
+                };
+                let paths = if paths.is_empty() { self.current_dir().map(|d| vec![d.to_path_buf()]).unwrap_or_default() } else { paths };
                 if !paths.is_empty() {
                     cx.write_to_clipboard(ClipboardItem::new_string(join_paths(&paths)));
                     self.notice("Путь скопирован", cx);
                 }
             }
+            Cmd::ToggleHidden => self.toggle_hidden(cx),
+            Cmd::SelectAll => self.select_all(cx),
         }
         cx.notify();
     }
 
-    fn paste(&mut self, cx: &mut Context<Self>) {
+    fn paste(&mut self, dest: PathBuf, cx: &mut Context<Self>) {
         // Свой буфер, а если он пуст — пути из системного (например, из терминала).
         let clip = self.clipboard.clone().or_else(|| {
             let text = cx.read_from_clipboard()?.text()?;
-            let paths = parse_paths(&text)?;
-            Some(Clip { mode: Mode::Copy, paths })
+            Some(Clip { mode: Mode::Copy, paths: parse_paths(&text)? })
         });
         let Some(clip) = clip else {
             return self.notice("Буфер обмена пуст", cx);
         };
-        let (_, mut dest) = self.dest_dir();
-        // Ctrl+C, Ctrl+V на той же папке — это дубликат рядом с ней, а не копия внутрь себя.
-        if let Some(p) = clip.paths.iter().find(|s| dest.starts_with(s)).and_then(|s| s.parent()) {
-            dest = p.to_path_buf();
-        }
-        let title = if clip.mode == Mode::Move { "Перемещение" } else { "Копирование" };
         let cut = clip.mode == Mode::Move;
+        let title = if cut { "Перемещение" } else { "Копирование" };
         self.run_job(title, JobKind::Paste { cut }, cx, move |p, a| ops::transfer(clip.mode, &clip.paths, &dest, p, a));
     }
 
-    /// Можно ли сейчас вставить (для пункта меню).
-    pub(super) fn can_paste(&self) -> bool {
-        self.clipboard.is_some()
-    }
-
-    /// Элементы, над которыми работает команда: отмеченные или выделенный.
-    /// Корень не входит; если отмечены и папка, и что-то внутри неё — берётся только папка.
-    pub(super) fn targets(&self) -> Vec<NodeId> {
-        let Some(tree) = &self.tree else { return Vec::new() };
-        let mut ids: Vec<NodeId> = if self.marked.is_empty() {
-            vec![self.selected]
-        } else {
-            self.marked.iter().copied().collect()
+    fn open_terminal(&mut self, cx: &mut Context<Self>) {
+        let rows = self.selected_rows();
+        let dir = match rows[..] {
+            [ix] if self.rows[ix].entry.is_dir => Some(self.rows[ix].entry.path.clone()),
+            _ => self.current_dir().map(Path::to_path_buf),
         };
-        ids.retain(|&id| id != Tree::ROOT && tree.contains(id));
-        let set: std::collections::HashSet<NodeId> = ids.iter().copied().collect();
-        ids.retain(|&id| !tree.ancestors(id).iter().any(|a| *a != id && set.contains(a)));
-        ids.sort_by_cached_key(|&id| tree.path(id));
-        ids
+        let Some(dir) = dir else { return };
+        match terminal() {
+            Some(t) => {
+                if let Err(e) = std::process::Command::new(&t).current_dir(&dir).spawn() {
+                    self.notice(format!("Не удалось запустить {t}: {e}"), cx);
+                }
+            }
+            None => self.notice("Терминал не найден: задайте переменную TERMINAL", cx),
+        }
     }
 
+    /// Пути выделенных элементов в порядке показа.
     pub(super) fn target_paths(&self) -> Vec<PathBuf> {
-        let Some(tree) = &self.tree else { return Vec::new() };
-        self.targets().into_iter().map(|id| tree.path(id)).collect()
+        self.selected_rows().into_iter().map(|i| self.rows[i].entry.path.clone()).collect()
     }
 
-    /// Куда вставлять и создавать: выделенная папка или папка выделенного файла.
-    pub(super) fn dest_dir(&self) -> (NodeId, PathBuf) {
-        let tree = self.tree.as_ref().expect("дерево есть");
-        let n = tree.node(self.selected);
-        let id = if n.is_dir { self.selected } else { n.parent.unwrap_or(Tree::ROOT) };
-        (id, tree.path(id))
+    /// Записи корзины: выделенные или все.
+    fn trash_items(&self, only_selected: bool) -> Vec<TrashedItem> {
+        let ids: Vec<usize> = if only_selected { self.selected_rows() } else { (0..self.rows.len()).collect() };
+        ids.into_iter()
+            .filter_map(|i| {
+                let e = &self.rows[i].entry;
+                let t = e.trash.as_ref()?;
+                Some(TrashedItem { original: t.original.clone(), file: e.path.clone(), info: t.info.clone() })
+            })
+            .collect()
     }
+
+    fn selected_name(&self) -> Option<String> {
+        match self.selected_rows()[..] {
+            [ix] => Some(self.rows[ix].entry.name.clone()),
+            _ => None,
+        }
+    }
+
+    // ---------- контекстные меню ----------
+
+    /// Меню для выделенных элементов (правый щелчок по файлу или папке).
+    pub(super) fn open_item_menu(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let rows = self.selected_rows();
+        let single = rows.len() == 1;
+        let single_dir = single && self.rows[rows[0]].entry.is_dir;
+        let items = if self.in_trash() {
+            vec![
+                Some(MenuItem::new("Восстановить", "", Cmd::Restore, true)),
+                None,
+                Some(MenuItem::new("Удалить насовсем…", "Delete", Cmd::Delete, true).danger()),
+                None,
+                Some(MenuItem::new("Копировать исходный путь", "", Cmd::CopyPath, true)),
+            ]
+        } else {
+            vec![
+                Some(MenuItem::new("Открыть", "Enter", Cmd::Open, true)),
+                single_dir.then(|| MenuItem::new("Открыть терминал здесь", "", Cmd::OpenTerminal, true)),
+                None,
+                Some(MenuItem::new("Вырезать", "Ctrl+X", Cmd::Cut, true)),
+                Some(MenuItem::new("Копировать", "Ctrl+C", Cmd::Copy, true)),
+                single_dir.then(|| MenuItem::new("Вставить в папку", "", Cmd::PasteInto, self.clipboard.is_some())),
+                None,
+                Some(MenuItem::new("В корзину", "Delete", Cmd::Trash, true)),
+                Some(MenuItem::new("Удалить насовсем…", "Shift+Delete", Cmd::Delete, true).danger()),
+                None,
+                Some(MenuItem::new("Переименовать…", "F2", Cmd::Rename, single)),
+                Some(MenuItem::new("Копировать путь", "", Cmd::CopyPath, true)),
+            ]
+        };
+        self.menu = Some(Menu { pos, items: compact(items) });
+        cx.notify();
+    }
+
+    /// Меню папки (правый щелчок по пустому месту).
+    pub(super) fn open_folder_menu(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let items = if self.in_trash() {
+            vec![Some(MenuItem::new("Очистить корзину…", "", Cmd::EmptyTrash, !self.rows.is_empty()).danger())]
+        } else {
+            let undo = self.undo.last().map(|r| format!("Отменить {}", r.describe()));
+            vec![
+                Some(MenuItem::new("Создать папку…", "Ctrl+Shift+N", Cmd::NewFolder, true)),
+                Some(MenuItem::new("Создать пустой файл…", "", Cmd::NewFile, true)),
+                None,
+                Some(MenuItem::new("Вставить", "Ctrl+V", Cmd::Paste, self.clipboard.is_some())),
+                None,
+                Some(MenuItem::new("Открыть терминал здесь", "", Cmd::OpenTerminal, true)),
+                Some(MenuItem::new("Копировать путь", "", Cmd::CopyPath, true)),
+                None,
+                Some(MenuItem::new("Выделить всё", "Ctrl+A", Cmd::SelectAll, !self.visible.is_empty())),
+                Some(MenuItem::new(
+                    if self.show_hidden { "Не показывать скрытые" } else { "Показать скрытые" },
+                    "Ctrl+H",
+                    Cmd::ToggleHidden,
+                    true,
+                )),
+                None,
+                Some(MenuItem::new(undo.clone().unwrap_or_else(|| "Отменить".into()), "Ctrl+Z", Cmd::Undo, undo.is_some())),
+            ]
+        };
+        self.menu = Some(Menu { pos, items: compact(items) });
+        cx.notify();
+    }
+
+    // ---------- сообщения ----------
 
     pub(super) fn notice(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.notice = Some((text.into(), Instant::now()));
@@ -281,20 +423,16 @@ impl FilesView {
         let p = progress.clone();
         let bg = cx.background_executor().spawn(async move {
             let asker = UiAsker(tx);
-            let out = work(&p, &asker);
-            drop(asker);
-            // Затронутые пути перечитываем здесь же, в фоне: папки бывают большими.
-            let refresh = rescan(&out.touched);
-            (out, refresh)
+            work(&p, &asker)
         });
         let task = cx.spawn(async move |this, cx| {
-            let (out, refresh) = bg.await;
+            let out = bg.await;
             let _ = this.update(cx, |this, cx| {
-                this.finish_job(kind, out, refresh, cx);
+                this.finish_job(kind, out, cx);
                 cx.notify();
             });
         });
-        self.job = Some(Job { title: title.into(), progress, started: Instant::now(), conflicts: rx, _task: task });
+        self.job = Some(Job { title: title.into(), progress, conflicts: rx, _task: task });
 
         // Пока операция идёт: перерисовываем прогресс и забираем вопросы о конфликтах.
         cx.spawn(async move |this, cx| {
@@ -321,24 +459,29 @@ impl FilesView {
         cx.notify();
     }
 
-    fn finish_job(&mut self, kind: JobKind, out: Outcome, refresh: Vec<(PathBuf, Option<RawNode>)>, cx: &mut Context<Self>) {
+    fn finish_job(&mut self, kind: JobKind, out: Outcome, cx: &mut Context<Self>) {
         let title = self.job.take().map(|j| j.title).unwrap_or_default();
         if matches!(self.dialog, Some(Dialog::Conflict { .. })) {
             self.dialog = None;
         }
+        // Выделяем то, что появилось в этой папке (или вернулось при отмене).
         let select = match (&kind, &out.record) {
             (JobKind::Undo(r), _) => restored_paths(r),
             (_, Some(r)) => new_paths(r),
             _ => Vec::new(),
         };
-        self.apply_refresh(refresh, &select);
+        let here: Vec<PathBuf> = match &self.location {
+            Target::Dir(d) => select.into_iter().filter(|p| p.parent() == Some(d.as_path())).collect(),
+            Target::Trash => Vec::new(),
+        };
+        self.load(here, cx);
 
         if let JobKind::Paste { cut: true } = kind {
             if out.record.is_some() {
                 self.clipboard = None;
             }
         }
-        if !matches!(kind, JobKind::Undo(_)) {
+        if matches!(kind, JobKind::Normal | JobKind::Paste { .. }) {
             if let Some(r) = out.record {
                 self.undo.push(r);
                 if self.undo.len() > UNDO_LIMIT {
@@ -354,82 +497,41 @@ impl FilesView {
             self.notice(format!("{title}: готово"), cx);
         }
     }
+}
 
-    /// Заменяет в дереве затронутые узлы свежими данными с диска, сохраняя
-    /// выделение, раскрытые папки, корень карты и фильтр типа.
-    fn apply_refresh(&mut self, refresh: Vec<(PathBuf, Option<RawNode>)>, select: &[PathBuf]) {
-        let Some(arc) = self.tree.as_mut() else { return };
-        let old: &Tree = arc;
-        let sel_path = old.path(self.selected);
-        let view_path = old.path(self.view_root);
-        let expanded: Vec<PathBuf> =
-            self.expanded.iter().filter(|&&id| old.contains(id)).map(|&id| old.path(id)).collect();
-        let marked: Vec<PathBuf> =
-            self.marked.iter().filter(|&&id| old.contains(id)).map(|&id| old.path(id)).collect();
-        let filter_ext = self.type_filter.and_then(|k| old.types.get(k as usize)).map(|t| t.ext.clone());
-
-        let tree = Arc::make_mut(arc);
-        for (path, raw) in refresh {
-            if let Some(id) = tree.find(&path) {
-                if id == Tree::ROOT {
-                    continue;
-                }
-                tree.remove(id);
-            }
-            if let (Some(raw), Some(parent)) = (raw, path.parent().and_then(|p| tree.find(p))) {
-                tree.insert(parent, raw);
-            }
+/// Убирает пустые пункты и повторяющиеся или крайние разделители.
+fn compact(items: Vec<Option<MenuItem>>) -> Vec<Option<MenuItem>> {
+    let mut out: Vec<Option<MenuItem>> = Vec::new();
+    for it in items {
+        match it {
+            Some(i) => out.push(Some(i)),
+            None if out.last().is_some_and(Option::is_some) => out.push(None),
+            None => {}
         }
+    }
+    while out.last().is_some_and(Option::is_none) {
+        out.pop();
+    }
+    out
+}
 
-        let tree = self.tree.clone().unwrap();
-        self.expanded = expanded.iter().filter_map(|p| tree.find(p)).collect();
-        self.expanded.insert(Tree::ROOT);
-        self.view_root = nearest(&tree, &view_path);
-        if !tree.node(self.view_root).is_dir {
-            self.view_root = tree.node(self.view_root).parent.unwrap_or(Tree::ROOT);
-        }
-        self.selected = nearest(&tree, &sel_path);
-        self.marked = marked.iter().filter_map(|p| tree.find(p)).collect();
-        self.type_filter =
-            filter_ext.and_then(|e| tree.types.iter().position(|t| t.ext == e)).map(|i| i as u16);
-        self.invalidate_map();
-
-        let new: Vec<NodeId> = select.iter().filter_map(|p| tree.find(p)).collect();
-        if let Some(&first) = new.first() {
-            self.marked = if new.len() > 1 { new.iter().copied().collect() } else { Default::default() };
-            self.reveal(first);
-        } else {
-            self.rebuild_rows();
-        }
+fn delete_title(n: usize, single: Option<String>) -> String {
+    match single {
+        Some(name) if n == 1 => format!("Удалить насовсем «{name}»?"),
+        _ => format!("Удалить насовсем {}?", super::items_label(n as u64)),
     }
 }
 
-/// Свежие данные с диска для затронутых путей. Если в списке есть и папка,
-/// и что-то внутри неё, перечитывается только папка.
-fn rescan(touched: &[PathBuf]) -> Vec<(PathBuf, Option<RawNode>)> {
-    touched
-        .iter()
-        .filter(|p| !touched.iter().any(|q| q != *p && p.starts_with(q)))
-        .map(|p| {
-            let raw = scan(p, &ScanOptions::default(), &Progress::default()).ok().map(|mut r| {
-                r.name = ops::display_name(p).into();
-                r
-            });
-            (p.clone(), raw)
-        })
-        .collect()
-}
-
-/// Ближайший существующий узел по пути (сам путь или его предок).
-fn nearest(tree: &Tree, path: &Path) -> NodeId {
-    let mut cur = Some(path);
-    while let Some(p) = cur {
-        if let Some(id) = tree.find(p) {
-            return id;
-        }
-        cur = p.parent();
+/// Программа-терминал: `$TERMINAL` или первый найденный из известных.
+fn terminal() -> Option<String> {
+    if let Some(t) = std::env::var("TERMINAL").ok().filter(|t| !t.is_empty()) {
+        return Some(t);
     }
-    Tree::ROOT
+    let path = std::env::var_os("PATH")?;
+    ["foot", "alacritty", "kitty", "wezterm", "ghostty", "konsole", "gnome-terminal", "xfce4-terminal", "xterm"]
+        .into_iter()
+        .find(|t| std::env::split_paths(&path).any(|d| d.join(t).is_file()))
+        .map(String::from)
 }
 
 /// Что выделить после операции: то, что появилось.
@@ -460,19 +562,17 @@ fn join_paths(paths: &[PathBuf]) -> String {
 fn count_label(paths: &[PathBuf]) -> String {
     match paths {
         [one] => format!("«{}»", ops::display_name(one)),
-        _ => format!("{} элементов", paths.len()),
+        _ => super::items_label(paths.len() as u64),
     }
 }
 
 /// Пути из текста буфера: по одному на строку, абсолютные или `file://`, все существуют.
 fn parse_paths(text: &str) -> Option<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
     let mut out = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let p = match line.strip_prefix("file://") {
-            Some(rest) => {
-                use std::os::unix::ffi::OsStringExt;
-                PathBuf::from(std::ffi::OsString::from_vec(percent_decode(rest)))
-            }
+            Some(rest) => PathBuf::from(std::ffi::OsString::from_vec(percent_decode(rest))),
             None => PathBuf::from(line),
         };
         if !p.is_absolute() || fs::symlink_metadata(&p).is_err() {
@@ -513,5 +613,12 @@ mod tests {
         assert_eq!(parse_paths("/\nfile:///tmp\n"), Some(vec![PathBuf::from("/"), PathBuf::from("/tmp")]));
         assert_eq!(parse_paths("просто текст"), None);
         assert_eq!(parse_paths(""), None);
+    }
+
+    #[test]
+    fn menu_separators_are_tidy() {
+        let it = || Some(MenuItem::new("x", "", Cmd::Open, true));
+        let v = compact(vec![None, it(), None, None, None, it(), None]);
+        assert_eq!(v.iter().map(Option::is_some).collect::<Vec<_>>(), [true, false, true]);
     }
 }

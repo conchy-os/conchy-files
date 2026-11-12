@@ -1,25 +1,39 @@
 mod ui;
 
-use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
+use std::borrow::Cow;
+
+use gpui::{App, Application, AssetSource, Bounds, SharedString, WindowBounds, WindowOptions, prelude::*, px, size};
+
+/// Ресурсы для `svg()` — файлы иконок темы прямо с диска по абсолютному пути.
+struct FsAssets;
+
+impl AssetSource for FsAssets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        Ok(std::fs::read(path).ok().map(Cow::Owned))
+    }
+
+    fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
+}
 
 fn main() {
-    let root = std::env::args_os()
+    let start = std::env::args_os()
         .nth(1)
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(Into::into))
-        .unwrap_or_else(|| "/".into());
-    let root = std::fs::canonicalize(&root).unwrap_or(root);
+        .unwrap_or_else(conchy_files::places::home);
+    let start = std::fs::canonicalize(&start).unwrap_or(start);
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(FsAssets).run(move |cx: &mut App| {
         ui::bind_keys(cx);
-        let bounds = Bounds::centered(None, size(px(1280.), px(820.)), cx);
+        let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some("conchy-files".into()),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| ui::FilesView::new(root.clone(), window, cx)),
+            |window, cx| cx.new(|cx| ui::FilesWindow::new(start.clone(), window, cx)),
         )
         .unwrap();
         cx.on_window_closed(|cx| {
