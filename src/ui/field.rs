@@ -75,9 +75,19 @@ impl TextField {
     }
 
     pub fn render(&self) -> impl IntoElement {
-        let before = self.text[..self.sel.start].to_string();
-        let selected = self.text[self.sel.clone()].to_string();
-        let after = self.text[self.sel.end..].to_string();
+        self.render_inner(false)
+    }
+
+    /// Поле пароля: вместо символов — точки.
+    pub fn render_masked(&self) -> impl IntoElement {
+        self.render_inner(true)
+    }
+
+    fn render_inner(&self, masked: bool) -> impl IntoElement {
+        let show = |s: &str| if masked { "•".repeat(s.chars().count()) } else { s.to_string() };
+        let before = show(&self.text[..self.sel.start]);
+        let selected = show(&self.text[self.sel.clone()]);
+        let after = show(&self.text[self.sel.end..]);
         let caret = div().w(px(1.)).h(px(15.)).flex_shrink_0().bg(rgb(TEXT));
         div()
             .flex()

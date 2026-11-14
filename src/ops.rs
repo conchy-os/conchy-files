@@ -117,6 +117,10 @@ pub enum Record {
     Trashed(Vec<TrashedItem>),
     /// Новая папка или пустой файл.
     Created(PathBuf),
+    /// Возвращены из корзины (так отменяется удаление в корзину); отмена — снова в корзину.
+    Restored(Vec<PathBuf>),
+    /// Созданное удалено (так отменяется создание); отмена — создать заново.
+    Removed { path: PathBuf, is_dir: bool },
 }
 
 impl Record {
@@ -131,6 +135,8 @@ impl Record {
             Record::Renamed { .. } => "переименование".into(),
             Record::Trashed(v) => format!("удаление в корзину{}", count(v.len())),
             Record::Created(p) => format!("создание «{}»", display_name(p)),
+            Record::Restored(v) => format!("восстановление из корзины{}", count(v.len())),
+            Record::Removed { path, .. } => format!("удаление «{}»", display_name(path)),
         }
     }
 }
@@ -164,8 +170,6 @@ pub enum Mode {
     Copy,
     Move,
 }
-
-// ---------- копирование и перемещение ----------
 
 /// Копирует или переносит `sources` внутрь папки `dest_dir`.
 pub fn transfer(
@@ -498,8 +502,6 @@ fn remove_all(path: &Path) -> io::Result<()> {
     if meta.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) }
 }
 
-// ---------- простые операции ----------
-
 /// Проверка имени файла, которое ввёл пользователь.
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
@@ -668,20 +670,22 @@ pub fn erase_all(items: &[TrashedItem], progress: &JobProgress) -> Outcome {
     out
 }
 
-// ---------- отмена ----------
-
-/// Выполняет обратную операцию.
+/// Выполняет обратную операцию. В `record` результата — запись, отмена которой
+/// повторит исходную операцию (так работает «Повторить», `Ctrl+Shift+Z`).
 pub fn undo(record: &Record, progress: &JobProgress) -> Outcome {
     let mut out = Outcome::default();
     match record {
         // Копии не удаляем насовсем, а отправляем в корзину: вдруг в них уже что-то поменяли.
-        Record::Copied(created) => {
-            let mut o = trash_all(created, progress);
-            o.record = None;
-            return o;
+        // Повтор — вернуть их из корзины.
+        Record::Copied(created) => return trash_all(created, progress),
+        Record::Restored(paths) => return trash_all(paths, progress),
+        Record::Removed { path, is_dir } => {
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            return create(parent, &display_name(path), *is_dir);
         }
         Record::Moved(pairs) => {
             progress.total_items.store(pairs.len() as u64, Ordering::Relaxed);
+            let mut back = Vec::new();
             for (from, to) in pairs.iter().rev() {
                 progress.set_current(to);
                 if fs::symlink_metadata(from).is_ok() {
@@ -705,10 +709,15 @@ pub fn undo(record: &Record, progress: &JobProgress) -> Outcome {
                     Ok(()) => {
                         out.touch(to);
                         out.touch(from);
+                        back.push((to.clone(), from.clone()));
                     }
                     Err(e) => out.error(to, e),
                 }
                 progress.item_done();
+            }
+            back.reverse();
+            if !back.is_empty() {
+                out.record = Some(Record::Moved(back));
             }
         }
         Record::Renamed { from, to } => {
@@ -719,6 +728,7 @@ pub fn undo(record: &Record, progress: &JobProgress) -> Outcome {
                     Ok(()) => {
                         out.touch(to);
                         out.touch(from);
+                        out.record = Some(Record::Renamed { from: to.clone(), to: from.clone() });
                     }
                     Err(e) => out.error(to, e),
                 }
@@ -726,13 +736,20 @@ pub fn undo(record: &Record, progress: &JobProgress) -> Outcome {
         }
         Record::Trashed(items) => {
             progress.total_items.store(items.len() as u64, Ordering::Relaxed);
+            let mut restored = Vec::new();
             for item in items {
                 progress.set_current(&item.original);
                 match trash::restore(item) {
-                    Ok(()) => out.touch(&item.original),
+                    Ok(()) => {
+                        out.touch(&item.original);
+                        restored.push(item.original.clone());
+                    }
                     Err(e) => out.error(&item.original, e),
                 }
                 progress.item_done();
+            }
+            if !restored.is_empty() {
+                out.record = Some(Record::Restored(restored));
             }
         }
         Record::Created(path) => {
@@ -745,10 +762,23 @@ pub fn undo(record: &Record, progress: &JobProgress) -> Outcome {
                     return out;
                 }
             };
-            let res = if empty { remove_all(path) } else { trash::trash(path).map(drop) };
-            match res {
-                Ok(()) => out.touch(path),
-                Err(e) => out.error(path, e),
+            let is_dir = fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+            if empty {
+                match remove_all(path) {
+                    Ok(()) => {
+                        out.touch(path);
+                        out.record = Some(Record::Removed { path: path.clone(), is_dir });
+                    }
+                    Err(e) => out.error(path, e),
+                }
+            } else {
+                match trash::trash(path) {
+                    Ok(item) => {
+                        out.touch(path);
+                        out.record = Some(Record::Trashed(vec![item]));
+                    }
+                    Err(e) => out.error(path, e),
+                }
             }
         }
     }
@@ -762,8 +792,6 @@ impl Asker for NeverAsk {
         Answer { resolution: Resolution::Skip, apply_to_all: true }
     }
 }
-
-// ---------- имена ----------
 
 /// Делит имя на основу и расширение так же, как Thunar: `a.tar.gz` → (`a`, `.tar.gz`),
 /// `.bashrc` → (`.bashrc`, ``). У папок расширения нет.
@@ -946,13 +974,11 @@ mod tests {
         v.sort();
         assert_eq!(v, vec![d.join("b/a/sub/y.txt"), d.join("b/a/x.txt")]);
 
-        // Пропустить.
         fs::write(d.join("a/x.txt"), "newer").unwrap();
         let skip = asker(Resolution::Skip, false);
         transfer(Mode::Copy, &[d.join("a/x.txt")], &d.join("b/a"), &JobProgress::default(), &skip);
         assert_eq!(read(&d.join("b/a/x.txt")), "new-x");
 
-        // Переименовать.
         let ren = asker(Resolution::Rename, false);
         let o = transfer(Mode::Copy, &[d.join("a/x.txt")], &d.join("b/a"), &JobProgress::default(), &ren);
         assert_eq!(o.record, Some(Record::Copied(vec![d.join("b/a/x (копия 1).txt")])));
@@ -1017,6 +1043,28 @@ mod tests {
         assert!(d.join("a (копия 1).txt").exists());
         undo(o.record.as_ref().unwrap(), &JobProgress::default());
         assert!(!d.join("a (копия 1).txt").exists() && d.join("a.txt").exists());
+
+        // Отмена отмены — повтор: переименование туда-обратно, создание, корзина, копирование.
+        let p = JobProgress::default();
+        let o = rename(&d.join("a.txt"), "c.txt");
+        let u = undo(o.record.as_ref().unwrap(), &p);
+        assert!(d.join("a.txt").exists());
+        let r = undo(u.record.as_ref().unwrap(), &p);
+        assert!(d.join("c.txt").exists() && !d.join("a.txt").exists(), "повтор переименования");
+        undo(r.record.as_ref().unwrap(), &p);
+        assert!(d.join("a.txt").exists(), "и снова отмена");
+
+        let o = create(&d, "Папка", true);
+        let u = undo(o.record.as_ref().unwrap(), &p);
+        assert!(matches!(u.record, Some(Record::Removed { is_dir: true, .. })));
+        undo(u.record.as_ref().unwrap(), &p);
+        assert!(d.join("Папка").is_dir(), "повтор создания");
+
+        let o = trash_all(&[d.join("a.txt")], &p);
+        let u = undo(o.record.as_ref().unwrap(), &p);
+        assert!(d.join("a.txt").exists());
+        undo(u.record.as_ref().unwrap(), &p);
+        assert!(!d.join("a.txt").exists(), "повтор удаления в корзину");
 
         let o = delete_all(&[d.join("taken")], &JobProgress::default());
         assert!(o.record.is_none() && !d.join("taken").exists());

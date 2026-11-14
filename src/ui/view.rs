@@ -19,11 +19,12 @@ use super::{ACCENT, BORDER, DIM, FilesWindow, GoBack, GoForward, GoHome, GoUp, P
 const BASE_FONT: f32 = 13.0;
 const ROW_H: f32 = 24.0;
 const COL_SIZE: f32 = 96.0;
+const COL_SHARE: f32 = 112.0;
 const COL_TYPE: f32 = 180.0;
 const COL_DATE: f32 = 150.0;
 
 /// Иконка из темы по пути или пустое место того же размера.
-fn icon(path: Option<&PathBuf>, size: f32) -> AnyElement {
+pub(super) fn icon(path: Option<&PathBuf>, size: f32) -> AnyElement {
     match path {
         Some(p) => img(p.clone()).size(px(size)).flex_shrink_0().into_any_element(),
         None => div().size(px(size)).flex_shrink_0().into_any_element(),
@@ -31,7 +32,7 @@ fn icon(path: Option<&PathBuf>, size: f32) -> AnyElement {
 }
 
 /// Одноцветная иконка кнопки (`go-previous` → `go-previous-symbolic.svg`), окрашенная в `color`.
-fn symbolic(name: &str, fallback: &'static str, color: impl Into<Hsla>) -> AnyElement {
+pub(super) fn symbolic(name: &str, fallback: &'static str, color: impl Into<Hsla>) -> AnyElement {
     let color = color.into();
     match icons::symbolic(name) {
         Some(p) => svg().path(SharedString::from(p.display().to_string())).size(px(16.)).flex_shrink_0().text_color(color).into_any_element(),
@@ -40,12 +41,23 @@ fn symbolic(name: &str, fallback: &'static str, color: impl Into<Hsla>) -> AnyEl
 }
 
 impl FilesWindow {
+    /// Колонка «% от папки» имеет смысл только в обычной папке.
+    fn show_share(&self) -> bool {
+        self.search.is_none() && !self.in_trash()
+    }
+
+    /// Доля элемента в текущей папке. Итог папки — из анализа места, если он есть,
+    /// иначе сумма известных размеров. У папки без анализа доля неизвестна.
+    fn share_of(&self, e: &conchy_files::dir::Entry) -> Option<f64> {
+        let size = if e.is_dir { e.deep_size? } else { e.size };
+        let total: u64 = self.rows.iter().map(|r| total_size(&r.entry)).sum();
+        (total > 0).then(|| size as f64 / total as f64)
+    }
+
     /// Размер, пересчитанный под шрифт из настроек.
     fn scaled(&self, v: f32) -> f32 {
         (v * self.config.font_size / BASE_FONT).round()
     }
-
-    // ---------- панель инструментов ----------
 
     pub(super) fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let parent = self.current_dir().and_then(Path::parent).is_some();
@@ -96,6 +108,9 @@ impl FilesWindow {
 
     /// Путь кнопками, как в Thunar; по `Ctrl+L` или щелчку по пустому месту — поле ввода.
     fn render_location(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(search) = self.render_search_field(cx) {
+            return search;
+        }
         if let Some(field) = &self.location_edit {
             return div().flex_1().min_w_0().child(field.render()).into_any_element();
         }
@@ -146,8 +161,6 @@ impl FilesWindow {
             .into_any_element()
     }
 
-    // ---------- боковая панель ----------
-
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let heading = |t: &'static str| div().px_3().pt_3().pb_1().text_color(rgb(DIM)).text_size(px(11.)).child(t);
         let mut col = div()
@@ -168,57 +181,23 @@ impl FilesWindow {
             let target = place.target.clone();
             let icon_path = icons::icons().lookup(&[place.icon.as_str(), "folder"], 16);
             col = col.child(
-                side_row(("place", i), active)
+                super::dnd::drop_target(side_row(("place", i), active), place.target.clone(), cx)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.navigate(target.clone(), cx)))
                     .child(icon(icon_path.as_ref(), 16.))
                     .child(div().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(place.name.clone())),
             );
         }
 
-        if !self.mounts.is_empty() {
-            col = col.child(heading("Устройства"));
-            for (i, m) in self.mounts.iter().enumerate() {
-                let target = Target::Dir(m.mount_point.clone());
-                // Подсвечиваем самое длинное подходящее место: внутри флешки — флешку, а не корень.
-                let best = self.current_dir().and_then(|c| {
-                    self.mounts.iter().filter(|x| c.starts_with(&x.mount_point)).max_by_key(|x| x.mount_point.as_os_str().len())
-                });
-                let in_place = self.places.iter().any(|p| p.target == self.location);
-                let active = !in_place && best.is_some_and(|b| b.mount_point == m.mount_point);
-                let icon_path = icons::icons().lookup(&[m.icon(), "drive-harddisk"], 16);
-                let used = m.used_fraction();
-                let tip = format!(
-                    "{} · {} · свободно {} из {}",
-                    m.device,
-                    m.fs_type,
-                    human_size(m.free),
-                    human_size(m.total)
-                );
-                col = col.child(
-                    side_row(("mount", i), active)
-                        .h(px(36.))
-                        .tooltip(tooltip(tip))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.navigate(target.clone(), cx)))
-                        .child(icon(icon_path.as_ref(), 16.))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .gap(px(3.))
-                                .child(div().overflow_hidden().text_ellipsis().whitespace_nowrap().child(m.name.clone()))
-                                .child(usage_bar(used)),
-                        ),
-                );
-            }
+        col = col.child(heading("Устройства")).children(self.render_devices(cx));
+        let network = self.render_network(cx);
+        if !network.is_empty() {
+            col = col.child(heading("Сеть")).children(network);
         }
         col
     }
 
-    // ---------- список ----------
-
-    pub(super) fn render_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_list(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let grid = self.view_mode != super::grid::ViewMode::List;
         let trash = self.in_trash();
         let header_cell = |id: &'static str, label: &'static str, key: SortKey, w: Option<f32>, right: bool, cx: &mut Context<Self>| {
             let arrow = if self.sort.key == key { if self.sort.ascending { " ▴" } else { " ▾" } } else { "" };
@@ -248,20 +227,31 @@ impl FilesWindow {
             .border_color(rgb(BORDER))
             .child(header_cell("h-name", "Имя", SortKey::Name, None, false, cx))
             .child(header_cell("h-size", "Размер", SortKey::Size, Some(self.scaled(COL_SIZE)), true, cx))
-            .child(header_cell("h-type", if trash { "Исходное место" } else { "Тип" }, SortKey::Type, Some(self.scaled(COL_TYPE)), false, cx))
+            .when(self.show_share(), |d| d.child(header_cell("h-share", "% от папки", SortKey::Size, Some(self.scaled(COL_SHARE)), false, cx)))
+            .child(header_cell("h-type", if trash { "Исходное место" } else if self.search.is_some() { "Где" } else { "Тип" }, SortKey::Type, Some(self.scaled(COL_TYPE)), false, cx))
             .child(header_cell("h-date", if trash { "Удалён" } else { "Изменён" }, SortKey::Modified, Some(self.scaled(COL_DATE)), false, cx));
 
         let body: AnyElement = if let Some(err) = &self.load_error {
             placeholder(err.clone())
         } else if self.visible.is_empty() && !self.loading {
             let hidden = self.rows.len();
-            placeholder(if hidden > 0 {
+            placeholder(if let Some(s) = &self.search {
+                if s.running {
+                    "Поиск…".to_string()
+                } else if s.field.text.trim().is_empty() {
+                    "Введите часть имени или шаблон вроде *.pdf".to_string()
+                } else {
+                    "Ничего не найдено".to_string()
+                }
+            } else if hidden > 0 {
                 format!("Только скрытые файлы ({hidden}) — Ctrl+H, чтобы показать")
             } else if trash {
                 "Корзина пуста".to_string()
             } else {
                 "Папка пуста".to_string()
             })
+        } else if grid {
+            self.render_grid(window, cx)
         } else {
             uniform_list(
                 "files",
@@ -283,6 +273,9 @@ impl FilesWindow {
 
         div()
             .id("list")
+            .when_some(self.current_dir().filter(|_| self.search.is_none()).map(Path::to_path_buf), |d, dir| {
+                super::dnd::drop_target(d, Target::Dir(dir), cx)
+            })
             .flex()
             .flex_col()
             .flex_1()
@@ -304,7 +297,7 @@ impl FilesWindow {
                     this.open_folder_menu(ev.position, cx);
                 }),
             )
-            .child(head)
+            .when(!grid, |d| d.child(head))
             .child(div().flex_1().min_h_0().child(body))
     }
 
@@ -314,8 +307,15 @@ impl FilesWindow {
         let selected = self.selected.contains(&e.path);
         let is_cursor = self.cursor.as_ref() == Some(&e.path);
         let dim = cut.contains(&e.path.as_path()) || e.is_hidden();
+        // Тащат выделенное целиком, если строка в нём; иначе — только эту строку.
+        let dragged = if selected { self.target_paths() } else { vec![e.path.clone()] };
+        let drop_dir = (e.is_dir && e.trash.is_none()).then(|| e.path.clone());
         div()
             .id(("row", pos))
+            .when(e.trash.is_none(), |d| {
+                d.on_drag(super::dnd::DraggedFiles { paths: dragged }, |d, _, _, cx| cx.new(|_| super::dnd::DragPreview::new(d)))
+            })
+            .when_some(drop_dir, |d, dir| super::dnd::drop_target(d, Target::Dir(dir), cx))
             .flex()
             .items_center()
             .h(px(self.scaled(ROW_H)))
@@ -369,12 +369,14 @@ impl FilesWindow {
                     ),
             )
             .child(cell(self.scaled(COL_SIZE)).justify_end().text_color(rgb(DIM)).child(row.size.clone()))
+            .when(self.show_share(), |d| {
+                let share = self.share_of(e);
+                d.child(cell(self.scaled(COL_SHARE)).child(share_bar(share, self.scaled(COL_SHARE) - 16.0)))
+            })
             .child(cell(self.scaled(COL_TYPE)).text_color(rgb(DIM)).child(row.kind.clone()))
             .child(cell(self.scaled(COL_DATE)).text_color(rgb(DIM)).child(row.date.clone()))
             .into_any_element()
     }
-
-    // ---------- строка состояния ----------
 
     pub(super) fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let sel = self.selected_rows();
@@ -479,7 +481,7 @@ impl Render for Tip {
     }
 }
 
-fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
+pub(super) fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
     let text = text.into();
     move |_, cx| cx.new(|_| Tip(text.clone())).into()
 }
@@ -515,7 +517,7 @@ fn crumb(
         .into_any_element()
 }
 
-fn side_row(id: impl Into<gpui::ElementId>, active: bool) -> gpui::Stateful<gpui::Div> {
+pub(super) fn side_row(id: impl Into<gpui::ElementId>, active: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -531,7 +533,35 @@ fn side_row(id: impl Into<gpui::ElementId>, active: bool) -> gpui::Stateful<gpui
 }
 
 /// Занятое место на диске: синяя полоска, ближе к заполнению — красная.
-fn usage_bar(used: f32) -> impl IntoElement {
+/// Полоска «% от папки» с числом поверх, как в WizTree. `None` — размер ещё неизвестен.
+fn share_bar(share: Option<f64>, w: f32) -> impl IntoElement {
+    let s = share.unwrap_or(0.0).clamp(0.0, 1.0);
+    div()
+        .relative()
+        .w(px(w))
+        .h(px(15.))
+        .rounded_sm()
+        .bg(rgb(BORDER))
+        .child(div().absolute().top_0().left_0().h_full().rounded_sm().bg(rgb(0x3d59a1)).w(px((s * w as f64) as f32)))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.))
+                .text_color(rgb(if share.is_some() { TEXT } else { DIM }))
+                .child(match share {
+                    Some(v) => format!("{:.1}%", v * 100.0),
+                    None => "—".into(),
+                }),
+        )
+}
+
+pub(super) fn usage_bar(used: f32) -> impl IntoElement {
     let color = if used > 0.9 { rgb(super::DANGER) } else { rgb(ACCENT) };
     div()
         .relative()

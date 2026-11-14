@@ -61,7 +61,6 @@ pub fn squarify(values: &[f64], bounds: Rect) -> Vec<Rect> {
         // Кладём ряд вдоль короткой стороны свободной области.
         let (fx, fy, fw, fh) = free;
         if fw >= fh {
-            // Колонка слева.
             let col_w = if fh > 0.0 { row_sum / fh } else { 0.0 };
             let mut y = fy;
             for i in start..end {
@@ -71,7 +70,6 @@ pub fn squarify(values: &[f64], bounds: Rect) -> Vec<Rect> {
             }
             free = (fx + col_w, fy, (fw - col_w).max(0.0), fh);
         } else {
-            // Строка сверху.
             let row_h = if fw > 0.0 { row_sum / fw } else { 0.0 };
             let mut x = fx;
             for i in start..end {

@@ -40,6 +40,10 @@ const PREVIEW_BYTES: usize = 16 * 1024;
 
 pub(super) struct Analysis {
     pub tree: Arc<Tree>,
+    /// Файловая система корня. Сканер не заходит на другие ФС, поэтому дерево
+    /// покрывает только пути на этой же: `/home` на отдельном подтоме btrfs в дереве
+    /// `/` — лишь пустая заглушка.
+    pub dev: u64,
     /// Когда сделан снимок (секунды Unix); у дерева из кеша — время того сканирования.
     pub scanned_at: i64,
     /// Сколько заняло полное сканирование корня.
@@ -137,8 +141,9 @@ impl FilesWindow {
 
     /// Дерево, в котором есть папка `p`, и её узел.
     fn analysis_for(&self, p: &Path) -> Option<(&Analysis, NodeId)> {
+        let dev = dev_of(p)?;
         self.panel.done.iter().find_map(|a| {
-            if !p.starts_with(analysis::root_path(&a.tree)) {
+            if a.dev != dev || !p.starts_with(analysis::root_path(&a.tree)) {
                 return None;
             }
             a.tree.find(p).map(|id| (a, id))
@@ -153,7 +158,7 @@ impl FilesWindow {
         cx.notify();
     }
 
-    pub(super) fn show_panel(&mut self, cx: &mut Context<Self>) {
+    pub fn show_panel(&mut self, cx: &mut Context<Self>) {
         if !self.config.panel_visible {
             self.toggle_panel(cx);
         }
@@ -233,12 +238,14 @@ impl FilesWindow {
                 match found {
                     Some(c) => {
                         let root = PathBuf::from(&*c.tree.node(Tree::ROOT).name);
-                        // В памяти уже есть дерево выше — оно не хуже кеша.
-                        if !this.panel.done.iter().any(|a| root.starts_with(analysis::root_path(&a.tree))) {
-                            this.panel.done.retain(|a| !analysis::root_path(&a.tree).starts_with(&root));
+                        // В памяти уже есть дерево, которое правда содержит эту папку, — оно не хуже кеша.
+                        let dev = dev_of(&root).unwrap_or(0);
+                        if this.analysis_for(&for_dir).is_none() {
+                            this.panel.done.retain(|a| a.dev != dev || !analysis::root_path(&a.tree).starts_with(&root));
                             this.panel.done.insert(
                                 0,
                                 Analysis {
+                                    dev,
                                     tree: Arc::new(c.tree),
                                     scanned_at: c.scanned_at,
                                     took: Duration::from_millis(c.took_ms),
@@ -256,6 +263,10 @@ impl FilesWindow {
                     None => {
                         this.panel.misses.insert(for_dir.clone());
                     }
+                }
+                // Защита от круга «загрузили из кеша — а анализа для папки всё нет»: дальше — сканирование.
+                if this.analysis_for(&for_dir).is_none() {
+                    this.panel.misses.insert(for_dir.clone());
                 }
                 // Следующая отрисовка запустит перепроверку или обычное сканирование.
                 cx.notify();
@@ -276,8 +287,12 @@ impl FilesWindow {
             .done
             .iter()
             .find(|a| {
+                // Вклеивать можно только в дерево той же файловой системы, где уже есть родитель.
                 let r = analysis::root_path(&a.tree);
-                root.starts_with(r) && r != root
+                root.starts_with(r)
+                    && r != root
+                    && dev_of(&root) == Some(a.dev)
+                    && root.parent().is_some_and(|parent| a.tree.find(parent).is_some())
             })
             .map(|a| (a.tree.clone(), self.panel.generation));
         let progress = Arc::new(Progress::default());
@@ -314,10 +329,12 @@ impl FilesWindow {
                 match res {
                     Ok(ScanResult::New(tree)) => {
                         // Деревья внутри нового больше не нужны: новое их покрывает.
-                        this.panel.done.retain(|a| !analysis::root_path(&a.tree).starts_with(&task_root));
+                        let dev = dev_of(&task_root).unwrap_or(0);
+                        this.panel.done.retain(|a| a.dev != dev || !analysis::root_path(&a.tree).starts_with(&task_root));
                         this.panel.done.insert(
                             0,
                             Analysis {
+                                dev,
                                 tree: Arc::new(tree),
                                 scanned_at: unix_now(),
                                 took,
@@ -356,7 +373,6 @@ impl FilesWindow {
         });
         self.panel.scanning = Some(Scanning { root, progress, started: Instant::now(), _task: task });
 
-        // Пока идёт обход, раз в 100 мс обновляем счётчики.
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_millis(100)).await;
@@ -412,7 +428,13 @@ impl FilesWindow {
             let _ = this.update(cx, |this, cx| {
                 let mut changed = false;
                 for a in &mut this.panel.done {
-                    if analysis::patch(Arc::make_mut(&mut a.tree), refresh.clone()) {
+                    // Только изменения на той же файловой системе, что и дерево.
+                    let mine: Vec<_> = refresh
+                        .iter()
+                        .filter(|(p, _)| p.parent().and_then(dev_of) == Some(a.dev))
+                        .cloned()
+                        .collect();
+                    if !mine.is_empty() && analysis::patch(Arc::make_mut(&mut a.tree), mine) {
                         a.dirty = true;
                         changed = true;
                     }
@@ -531,14 +553,12 @@ impl FilesWindow {
         cx.notify();
     }
 
-    // ---------- отрисовка ----------
-
     pub(super) fn render_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.config.panel_visible {
             return None;
         }
         let body = match self.panel_target() {
-            PanelTarget::File(ix) => self.render_file_panel(ix),
+            PanelTarget::File(ix) => self.render_file_panel(ix, cx),
             PanelTarget::Dir(p) => self.render_dir_panel(&p, cx),
             PanelTarget::Trash => self.render_trash_panel(),
             PanelTarget::Nothing => placeholder("Нечего показать"),
@@ -610,7 +630,6 @@ impl FilesWindow {
         let summary = self.summary(a, node);
         let n = tree.node(node);
 
-        // Шапка: что это, сколько весит; при наведении на карту — что под курсором.
         let title = match mount {
             Some(m) => m.name.clone(),
             None if p.parent().is_none() => "Файловая система".into(),
@@ -664,7 +683,6 @@ impl FilesWindow {
                 })),
             );
 
-        // Диск: занято и свободно, как в «Устройствах», но подробнее.
         let disk = mount.map(|m| {
             div()
                 .flex()
@@ -718,7 +736,6 @@ impl FilesWindow {
         let cache = self.panel.map.clone();
         let generation = self.panel.generation;
         let hovered = self.panel.hovered.as_ref().map(|c| c.rect);
-        // Подсвечиваем выбранное на карте и выделенное в списке.
         let mut marked: Vec<NodeId> = self.panel.picked.into_iter().collect();
         marked.extend(self.selected_rows().iter().filter_map(|&i| tree.find(&self.rows[i].entry.path)));
 
@@ -873,7 +890,7 @@ impl FilesWindow {
         col.into_any_element()
     }
 
-    fn render_file_panel(&self, ix: usize) -> AnyElement {
+    fn render_file_panel(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let row = &self.rows[ix];
         let e = &row.entry;
         let lmeta = std::fs::symlink_metadata(&e.path).ok();
@@ -922,13 +939,25 @@ impl FilesWindow {
             props.push(("Ссылка на", if e.broken { format!("{t} (не существует)") } else { t }));
         }
 
-        let grid = div().flex().flex_col().gap_1().p_3().flex_1().min_w_0().children(props.into_iter().map(|(k, v)| {
-            div()
-                .flex()
-                .gap_3()
-                .child(div().w(px(90.)).flex_shrink_0().text_color(rgb(DIM)).child(k))
-                .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(v))
-        }));
+        let perms = lmeta.as_ref().filter(|_| !e.is_symlink).map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            permissions_grid(e.path.clone(), m.mode(), m.uid(), cx)
+        });
+        let grid = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_3()
+            .flex_1()
+            .min_w_0()
+            .children(props.into_iter().map(|(k, v)| {
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(div().w(px(90.)).flex_shrink_0().text_color(rgb(DIM)).child(k))
+                    .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().whitespace_nowrap().child(v))
+            }))
+            .children(perms);
 
         div()
             .size_full()
@@ -950,6 +979,12 @@ impl FilesWindow {
     }
 }
 
+/// Номер файловой системы, на которой лежит путь.
+fn dev_of(p: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| m.dev())
+}
+
 fn save_one(cache: &DiskCache, tree: &Tree, at: i64, took_ms: u64, errors: u64) {
     if let Err(e) = cache.save(tree, at, took_ms, errors) {
         eprintln!("conchy-files: кеш анализа не сохранён: {e}");
@@ -958,6 +993,54 @@ fn save_one(cache: &DiskCache, tree: &Tree, at: i64, took_ms: u64, errors: u64) 
 
 fn unix_now() -> i64 {
     unsafe { libc::time(std::ptr::null_mut()) as i64 }
+}
+
+/// Права как в свойствах Thunar: владелец, группа, остальные × чтение, запись, выполнение.
+/// Менять можно только свой файл (иначе chmod всё равно откажет) — тогда сетка просто показывает.
+fn permissions_grid(path: PathBuf, mode: u32, owner: u32, cx: &mut Context<FilesWindow>) -> AnyElement {
+    let mine = owner == unsafe { libc::getuid() } || unsafe { libc::getuid() } == 0;
+    let mut grid = div().flex().flex_col().gap_1().pt_2().child(
+        div()
+            .flex()
+            .gap_3()
+            .text_color(rgb(DIM))
+            .child(div().w(px(90.)).child(if mine { "Права" } else { "Права (только чтение)" }))
+            .children(["чтение", "запись", "запуск"].map(|h| div().w(px(64.)).child(h))),
+    );
+    for (row, (label, shift)) in [("владелец", 6u32), ("группа", 3), ("остальные", 0)].into_iter().enumerate() {
+        let mut line = div().flex().gap_3().items_center().child(div().w(px(90.)).text_color(rgb(DIM)).child(label));
+        for (col, bit) in [4u32, 2, 1].into_iter().enumerate() {
+            let mask = bit << shift;
+            let on = mode & mask != 0;
+            let p = path.clone();
+            line = line.child(
+                div().w(px(64.)).child(
+                    div()
+                        .id(("perm", row * 3 + col))
+                        .size(px(16.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(if on { ACCENT } else { DIM }))
+                        .when(on, |d| d.bg(rgb(ACCENT)).text_color(rgb(BG)).child("✓"))
+                        .when(mine, |d| {
+                            d.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                let new = (mode ^ mask) & 0o7777;
+                                match std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(new)) {
+                                    // Список перечитается сам (inotify), панель — при отрисовке.
+                                    Ok(()) => cx.notify(),
+                                    Err(e) => this.notice(format!("Права не изменены: {e}"), cx),
+                                }
+                            }))
+                        }),
+                ),
+            );
+        }
+        grid = grid.child(line);
+    }
+    grid.into_any_element()
 }
 
 /// Текстовый ли тип: показываем начало файла.

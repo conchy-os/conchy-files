@@ -48,6 +48,18 @@ pub(super) enum Cmd {
     /// Нижняя панель: открыть (свойства выделенного) или переключить.
     ShowPanel,
     TogglePanel,
+    /// Устройство из боковой панели (индекс в списке разделов UDisks2).
+    OpenDevice(usize),
+    Mount(usize),
+    Unmount(usize),
+    Eject(usize),
+    /// Открыть выделенное программой из меню (индекс в `menu_apps`).
+    OpenWith(usize),
+    OpenWithDialog,
+    Redo,
+    View(super::grid::ViewMode),
+    /// Пользовательское действие из `files.kdl` (индекс в `custom`).
+    Custom(usize),
 }
 
 /// Что лежит в буфере обмена приложения.
@@ -78,8 +90,10 @@ pub(super) enum JobKind {
     Normal,
     /// Вставка; после успешного переноса буфер очищается, как в Thunar.
     Paste { cut: bool },
-    /// Отмена этой записи; сама в историю не попадает.
+    /// Отмена этой записи; обратная запись уходит в стек «Повторить».
     Undo(Record),
+    /// Повтор (отмена отмены); обратная запись возвращается в стек «Отменить».
+    Redo(Record),
     /// Операция в корзине: в историю не попадает.
     NoUndo,
 }
@@ -119,15 +133,16 @@ impl FilesWindow {
         self.menu = None;
         let trash = self.in_trash();
         match cmd {
-            Cmd::Open => {
-                let rows = self.selected_rows();
-                if let Some(&ix) = rows.iter().find(|&&i| self.rows[i].entry.is_dir) {
-                    self.open_row(ix, cx);
-                } else {
-                    for ix in rows {
-                        self.open_row(ix, cx);
-                    }
+            Cmd::Open => self.open_selection(cx),
+            Cmd::OpenWith(i) => {
+                if let Some(app) = self.menu_apps.get(i).cloned() {
+                    let files = self.target_paths();
+                    self.launch(&app, &files, cx);
                 }
+            }
+            Cmd::OpenWithDialog => {
+                let files = self.target_paths();
+                self.open_with_dialog(files, cx);
             }
             Cmd::OpenTerminal => self.open_terminal(cx),
             Cmd::Cut | Cmd::Copy if trash => self.notice("Из корзины файлы можно только восстановить", cx),
@@ -246,6 +261,17 @@ impl FilesWindow {
                 let r = rec.clone();
                 self.run_job(title, JobKind::Undo(rec), cx, move |p, _| ops::undo(&r, p));
             }
+            Cmd::Redo => {
+                if self.job.is_some() {
+                    return self.notice("Дождитесь окончания текущей операции", cx);
+                }
+                let Some(rec) = self.redo.pop() else {
+                    return self.notice("Нечего повторять", cx);
+                };
+                let title = format!("Повтор: {}", rec.describe());
+                let r = rec.clone();
+                self.run_job(title, JobKind::Redo(rec), cx, move |p, _| ops::undo(&r, p));
+            }
             Cmd::CopyPath => {
                 let paths: Vec<PathBuf> = if trash {
                     self.selected_rows().iter().filter_map(|&i| self.rows[i].entry.trash.as_ref().map(|t| t.original.clone())).collect()
@@ -261,7 +287,17 @@ impl FilesWindow {
             Cmd::ToggleHidden => self.toggle_hidden(cx),
             Cmd::SelectAll => self.select_all(cx),
             Cmd::ShowPanel => self.show_panel(cx),
+            Cmd::View(mode) => self.set_view(mode, cx),
+            Cmd::Custom(i) => {
+                let Some(a) = self.custom.get(i).cloned() else { return };
+                let cwd = self.current_dir().map(Path::to_path_buf).unwrap_or_else(conchy_files::places::home);
+                let paths = std::mem::take(&mut self.menu_targets);
+                if let Err(e) = a.run(&paths, &cwd) {
+                    self.notice(format!("«{}» не запустилось: {e}", a.name), cx);
+                }
+            }
             Cmd::TogglePanel => self.toggle_panel(cx),
+            Cmd::OpenDevice(_) | Cmd::Mount(_) | Cmd::Unmount(_) | Cmd::Eject(_) => self.device_cmd(cmd, cx),
         }
         cx.notify();
     }
@@ -321,8 +357,6 @@ impl FilesWindow {
         }
     }
 
-    // ---------- контекстные меню ----------
-
     /// Меню для выделенных элементов (правый щелчок по файлу или папке).
     pub(super) fn open_item_menu(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let rows = self.selected_rows();
@@ -337,8 +371,22 @@ impl FilesWindow {
                 Some(MenuItem::new("Копировать исходный путь", "", Cmd::CopyPath, true)),
             ]
         } else {
-            vec![
-                Some(MenuItem::new("Открыть", "Enter", Cmd::Open, true)),
+            // Как в Thunar: «Открыть в «Программа»», ещё пара подходящих и «Открыть с помощью…».
+            let files: Vec<PathBuf> = rows.iter().filter(|&&i| !self.rows[i].entry.is_dir).map(|&i| self.rows[i].entry.path.clone()).collect();
+            let only_files = files.len() == rows.len();
+            self.menu_apps = if only_files { self.menu_apps_for(&files) } else { Vec::new() };
+            let open_label = match self.menu_apps.first() {
+                Some(app) => format!("Открыть в «{}»", app.name),
+                None => "Открыть".into(),
+            };
+            let mut items = vec![Some(MenuItem::new(open_label, "Enter", Cmd::Open, true))];
+            for (i, app) in self.menu_apps.iter().enumerate().skip(1).take(2) {
+                items.push(Some(MenuItem::new(format!("Открыть в «{}»", app.name), "", Cmd::OpenWith(i), true)));
+            }
+            if only_files {
+                items.push(Some(MenuItem::new("Открыть с помощью другой программы…", "", Cmd::OpenWithDialog, true)));
+            }
+            items.extend(vec![
                 single_dir.then(|| MenuItem::new("Открыть терминал здесь", "", Cmd::OpenTerminal, true)),
                 None,
                 Some(MenuItem::new("Вырезать", "Ctrl+X", Cmd::Cut, true)),
@@ -352,7 +400,23 @@ impl FilesWindow {
                 Some(MenuItem::new("Копировать путь", "", Cmd::CopyPath, true)),
                 None,
                 Some(MenuItem::new(if single_dir { "Анализ места" } else { "Свойства" }, "Alt+Enter", Cmd::ShowPanel, true)),
-            ]
+            ]);
+            // Пользовательские действия из files.kdl, подходящие ко всему выделенному.
+            let sel: Vec<(PathBuf, bool, String)> =
+                rows.iter().map(|&i| (self.rows[i].entry.path.clone(), self.rows[i].entry.is_dir, self.rows[i].entry.mime.clone())).collect();
+            let custom: Vec<Option<MenuItem>> = self
+                .custom
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.applies(&sel))
+                .map(|(i, a)| Some(MenuItem::new(a.name.clone(), "", Cmd::Custom(i), true)))
+                .collect();
+            if !custom.is_empty() {
+                items.push(None);
+                items.extend(custom);
+            }
+            self.menu_targets = sel.into_iter().map(|(p, ..)| p).collect();
+            items
         };
         self.menu = Some(Menu { pos, items: compact(items) });
         cx.notify();
@@ -374,6 +438,10 @@ impl FilesWindow {
                 Some(MenuItem::new("Копировать путь", "", Cmd::CopyPath, true)),
                 None,
                 Some(MenuItem::new("Выделить всё", "Ctrl+A", Cmd::SelectAll, !self.visible.is_empty())),
+                None,
+                Some(MenuItem::new("Вид: значки", "Ctrl+1", Cmd::View(super::grid::ViewMode::Icons), self.view_mode != super::grid::ViewMode::Icons)),
+                Some(MenuItem::new("Вид: подробно", "Ctrl+2", Cmd::View(super::grid::ViewMode::List), self.view_mode != super::grid::ViewMode::List)),
+                Some(MenuItem::new("Вид: компактный", "Ctrl+3", Cmd::View(super::grid::ViewMode::Compact), self.view_mode != super::grid::ViewMode::Compact)),
                 Some(MenuItem::new(
                     if self.show_hidden { "Не показывать скрытые" } else { "Показать скрытые" },
                     "Ctrl+H",
@@ -382,6 +450,12 @@ impl FilesWindow {
                 )),
                 None,
                 Some(MenuItem::new(undo.clone().unwrap_or_else(|| "Отменить".into()), "Ctrl+Z", Cmd::Undo, undo.is_some())),
+                Some(MenuItem::new(
+                    self.redo.last().map(|r| format!("Повторить {}", r.describe())).unwrap_or_else(|| "Повторить".into()),
+                    "Ctrl+Shift+Z",
+                    Cmd::Redo,
+                    !self.redo.is_empty(),
+                )),
                 None,
                 Some(MenuItem::new(
                     if self.config.panel_visible { "Скрыть панель анализа" } else { "Анализ места" },
@@ -391,11 +465,25 @@ impl FilesWindow {
                 )),
             ]
         };
+        // Действия с `background true` — для самой папки.
+        let mut items = items;
+        if let Some(cwd) = self.current_dir().map(Path::to_path_buf) {
+            let custom: Vec<Option<MenuItem>> = self
+                .custom
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.background)
+                .map(|(i, a)| Some(MenuItem::new(a.name.clone(), "", Cmd::Custom(i), true)))
+                .collect();
+            if !custom.is_empty() {
+                items.push(None);
+                items.extend(custom);
+            }
+            self.menu_targets = vec![cwd];
+        }
         self.menu = Some(Menu { pos, items: compact(items) });
         cx.notify();
     }
-
-    // ---------- сообщения ----------
 
     pub(super) fn notice(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.notice = Some((text.into(), Instant::now()));
@@ -417,8 +505,6 @@ impl FilesWindow {
         }
     }
 
-    // ---------- фоновые операции ----------
-
     pub(super) fn run_job(
         &mut self,
         title: impl Into<String>,
@@ -427,8 +513,10 @@ impl FilesWindow {
         work: impl FnOnce(&JobProgress, &dyn Asker) -> Outcome + Send + 'static,
     ) {
         if self.job.is_some() {
-            if let JobKind::Undo(rec) = kind {
-                self.undo.push(rec);
+            match kind {
+                JobKind::Undo(rec) => self.undo.push(rec),
+                JobKind::Redo(rec) => self.redo.push(rec),
+                _ => {}
             }
             return self.notice("Дождитесь окончания текущей операции", cx);
         }
@@ -478,12 +566,8 @@ impl FilesWindow {
         if matches!(self.dialog, Some(Dialog::Conflict { .. })) {
             self.dialog = None;
         }
-        // Выделяем то, что появилось в этой папке (или вернулось при отмене).
-        let select = match (&kind, &out.record) {
-            (JobKind::Undo(r), _) => restored_paths(r),
-            (_, Some(r)) => new_paths(r),
-            _ => Vec::new(),
-        };
+        // У отмены и повтора в `record` — обратная запись, она же говорит, что появилось.
+        let select = out.record.as_ref().map(new_paths).unwrap_or_default();
         // Деревья анализа места обновляем точечно, без полного пересканирования.
         self.patch_analyses(out.touched.clone(), cx);
         let here: Vec<PathBuf> = match &self.location {
@@ -497,12 +581,19 @@ impl FilesWindow {
                 self.clipboard = None;
             }
         }
-        if matches!(kind, JobKind::Normal | JobKind::Paste { .. }) {
-            if let Some(r) = out.record {
-                self.undo.push(r);
-                if self.undo.len() > UNDO_LIMIT {
-                    self.undo.remove(0);
+        if let Some(r) = out.record {
+            match kind {
+                JobKind::Normal | JobKind::Paste { .. } => {
+                    self.undo.push(r);
+                    // Новое действие обрывает цепочку повторов, как в любом редакторе.
+                    self.redo.clear();
                 }
+                JobKind::Undo(_) => self.redo.push(r),
+                JobKind::Redo(_) => self.undo.push(r),
+                JobKind::NoUndo => {}
+            }
+            if self.undo.len() > UNDO_LIMIT {
+                self.undo.remove(0);
             }
         }
         if !out.errors.is_empty() {
@@ -539,7 +630,7 @@ fn delete_title(n: usize, single: Option<String>) -> String {
 }
 
 /// Программа-терминал: из `files.kdl`, иначе `$TERMINAL`, иначе первый найденный из известных.
-fn terminal(configured: Option<String>) -> Option<String> {
+pub(super) fn terminal(configured: Option<String>) -> Option<String> {
     if let Some(t) = configured.or_else(|| std::env::var("TERMINAL").ok()).filter(|t| !t.trim().is_empty()) {
         return Some(t);
     }
@@ -557,17 +648,8 @@ fn new_paths(r: &Record) -> Vec<PathBuf> {
         Record::Moved(v) => v.iter().map(|(_, to)| to.clone()).collect(),
         Record::Renamed { to, .. } => vec![to.clone()],
         Record::Created(p) => vec![p.clone()],
-        Record::Trashed(_) => Vec::new(),
-    }
-}
-
-/// Что выделить после отмены: то, что вернулось на место.
-fn restored_paths(r: &Record) -> Vec<PathBuf> {
-    match r {
-        Record::Moved(v) => v.iter().map(|(from, _)| from.clone()).collect(),
-        Record::Renamed { from, .. } => vec![from.clone()],
-        Record::Trashed(items) => items.iter().map(|i| i.original.clone()).collect(),
-        Record::Copied(_) | Record::Created(_) => Vec::new(),
+        Record::Restored(v) => v.clone(),
+        Record::Trashed(_) | Record::Removed { .. } => Vec::new(),
     }
 }
 
@@ -588,7 +670,7 @@ fn parse_paths(text: &str) -> Option<Vec<PathBuf>> {
     let mut out = Vec::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let p = match line.strip_prefix("file://") {
-            Some(rest) => PathBuf::from(std::ffi::OsString::from_vec(percent_decode(rest))),
+            Some(rest) => PathBuf::from(std::ffi::OsString::from_vec(conchy_files::percent_decode(rest))),
             None => PathBuf::from(line),
         };
         if !p.is_absolute() || fs::symlink_metadata(&p).is_err() {
@@ -599,33 +681,14 @@ fn parse_paths(text: &str) -> Option<Vec<PathBuf>> {
     (!out.is_empty()).then_some(out)
 }
 
-fn percent_decode(s: &str) -> Vec<u8> {
-    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_clipboard_paths() {
-        assert_eq!(percent_decode("/tmp/a%20b"), b"/tmp/a b");
-        assert_eq!(percent_decode("/x%2"), b"/x%2");
+        assert_eq!(conchy_files::percent_decode("/tmp/a%20b"), b"/tmp/a b");
+        assert_eq!(conchy_files::percent_decode("/x%2"), b"/x%2");
         assert_eq!(parse_paths("/\nfile:///tmp\n"), Some(vec![PathBuf::from("/"), PathBuf::from("/tmp")]));
         assert_eq!(parse_paths("просто текст"), None);
         assert_eq!(parse_paths(""), None);

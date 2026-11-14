@@ -62,7 +62,7 @@ fn parse_bookmarks(s: &str) -> Vec<Place> {
                 Some((u, n)) => (u, Some(n.trim().to_string())),
                 None => (l.trim(), None),
             };
-            let path = PathBuf::from(String::from_utf8_lossy(&percent_decode(uri.strip_prefix("file://")?)).into_owned());
+            let path = PathBuf::from(String::from_utf8_lossy(&crate::percent_decode(uri.strip_prefix("file://")?)).into_owned());
             let name = label.filter(|n| !n.is_empty()).unwrap_or_else(|| display_name(&path));
             Some(Place { name, icon: folder_icon(&path), target: Target::Dir(path) })
         })
@@ -252,25 +252,6 @@ pub fn statvfs(path: &Path) -> Option<(u64, u64)> {
     }
     let f = st.f_frsize as u64;
     Some((st.f_blocks as u64 * f, st.f_bavail as u64 * f))
-}
-
-fn percent_decode(s: &str) -> Vec<u8> {
-    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
 }
 
 #[cfg(test)]

@@ -2,9 +2,15 @@
 //! и «Устройства», список файлов и строка состояния.
 
 mod actions;
+mod devices;
 mod dialogs;
+mod dnd;
 mod field;
+mod grid;
+mod network;
+mod openwith;
 mod panel;
+mod search;
 mod view;
 
 use std::collections::{HashMap, HashSet};
@@ -33,7 +39,7 @@ actions!(
         SelectNext, SelectPrev, ExtendNext, ExtendPrev, SelectFirst, SelectLast, PageDown, PageUp, OpenSelected,
         GoBack, GoForward, GoUp, GoHome, EditLocation, ToggleHidden, Reload, CloseWindow, SelectAll, Escape,
         CutFiles, CopyFiles, PasteFiles, RenameItem, NewFolder, TrashFiles, DeleteFiles, Undo, TogglePanel,
-        ShowPanel
+        ShowPanel, StartSearch, Redo, ViewIcons, ViewList, ViewCompact, SelectLeft, SelectRight
     ]
 );
 
@@ -80,6 +86,14 @@ pub fn bind_keys(cx: &mut App) {
         // Нижняя панель: анализ места и свойства (в Thunar Alt+Enter — «Свойства»).
         KeyBinding::new("ctrl-i", TogglePanel, Some(CTX)),
         KeyBinding::new("alt-enter", ShowPanel, Some(CTX)),
+        KeyBinding::new("ctrl-f", StartSearch, Some(CTX)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(CTX)),
+        KeyBinding::new("ctrl-y", Redo, Some(CTX)),
+        KeyBinding::new("ctrl-1", ViewIcons, Some(CTX)),
+        KeyBinding::new("ctrl-2", ViewList, Some(CTX)),
+        KeyBinding::new("ctrl-3", ViewCompact, Some(CTX)),
+        KeyBinding::new("left", SelectLeft, Some(CTX)),
+        KeyBinding::new("right", SelectRight, Some(CTX)),
     ]);
 }
 
@@ -136,6 +150,27 @@ pub struct FilesWindow {
     location_edit: Option<TextField>,
     places: Vec<Place>,
     mounts: Vec<Mount>,
+    /// Разделы из UDisks2 (флешки, неподключённые диски, образы).
+    volumes: Vec<conchy_files::devices::Volume>,
+    /// UDisks2 доступен; иначе «Устройства» — только по таблице монтирования.
+    udisks: bool,
+    /// Устройства, которые сейчас подключаются или извлекаются.
+    device_busy: HashSet<String>,
+    /// Подключённые сетевые папки (точки монтирования FUSE).
+    remotes: Vec<PathBuf>,
+    /// Установленные программы для «Открыть с помощью» (читаются в фоне).
+    apps: Option<Arc<openwith::AppsIndex>>,
+    /// Программы, показанные в открытом контекстном меню.
+    menu_apps: Vec<conchy_files::apps::App>,
+    /// Пользовательские действия из `files.kdl` и пути, к которым откроется действие из меню.
+    custom: Vec<conchy_files::uca::CustomAction>,
+    menu_targets: Vec<PathBuf>,
+    /// Идёт поиск (`Ctrl+F`): в списке находки, а не содержимое папки.
+    search: Option<search::SearchState>,
+    view_mode: grid::ViewMode,
+    /// Плиток в ряду в виде значков (для стрелок вверх-вниз).
+    grid_cols: usize,
+    thumbs: grid::Thumbs,
     /// Особые иконки XDG-папок (`folder-download` и т. п.).
     special_icons: HashMap<PathBuf, String>,
     _watch: Option<watch::Watch>,
@@ -149,6 +184,7 @@ pub struct FilesWindow {
 
     clipboard: Option<Clip>,
     undo: Vec<conchy_files::ops::Record>,
+    redo: Vec<conchy_files::ops::Record>,
     job: Option<Job>,
     dialog: Option<Dialog>,
     menu: Option<Menu>,
@@ -156,8 +192,11 @@ pub struct FilesWindow {
 }
 
 impl FilesWindow {
+    /// `select_item` — открыть папку, где лежит `start`, и выделить его («Показать в папке»).
+    /// Для файла это происходит всегда, как `thunar файл`.
     pub fn new(
         start: PathBuf,
+        select_item: bool,
         settings: Arc<Settings>,
         config: FilesConfig,
         window: &mut Window,
@@ -174,10 +213,9 @@ impl FilesWindow {
             })
             .chain([(places::home(), "user-home".to_string())])
             .collect();
-        let (location, select) = if start.is_dir() {
+        let (location, select) = if start.is_dir() && !select_item {
             (Target::Dir(start), Vec::new())
         } else {
-            // Передали файл — открываем его папку и выделяем его, как `thunar файл`.
             let parent = start.parent().map(Path::to_path_buf).unwrap_or_else(places::home);
             (Target::Dir(parent), vec![start])
         };
@@ -203,6 +241,18 @@ impl FilesWindow {
             location_edit: None,
             places: places::places(),
             mounts: places::mounts(),
+            volumes: Vec::new(),
+            udisks: false,
+            device_busy: HashSet::new(),
+            remotes: conchy_files::remote::mounted(),
+            apps: None,
+            menu_apps: Vec::new(),
+            custom: Vec::new(),
+            menu_targets: Vec::new(),
+            search: None,
+            view_mode: Default::default(),
+            grid_cols: 1,
+            thumbs: Default::default(),
             special_icons,
             _watch: None,
             title: String::new(),
@@ -212,21 +262,23 @@ impl FilesWindow {
             panel: Default::default(),
             clipboard: None,
             undo: Vec::new(),
+            redo: Vec::new(),
             job: None,
             dialog: None,
             menu: None,
             notice: None,
         };
         this.configure_cache(cx);
+        this.custom = this.settings.actions();
         // Окно закрывают — дописываем на диск то, что ещё не записано.
         cx.on_release(|this, _| this.flush_cache_now()).detach();
         this.set_location(location, select, cx);
         this.poll_mounts(cx);
+        this.watch_devices(cx);
+        this.load_apps(cx);
         this.watch_config(cx);
         this
     }
-
-    // ---------- настройки (files.kdl) ----------
 
     /// Следит за `~/.config/conchy`: правки руками, `conchy-config set files …` и записи
     /// демона применяются сразу, без перезапуска.
@@ -250,7 +302,10 @@ impl FilesWindow {
 
     fn reload_config(&mut self, cx: &mut Context<Self>) {
         match self.settings.load() {
-            Ok(c) => self.apply_config(c, cx),
+            Ok(c) => {
+                self.custom = self.settings.actions();
+                self.apply_config(c, cx)
+            }
             // Ошибка в файле: оставляем прежние настройки и говорим, где искать.
             Err(e) => {
                 let first = e.lines().next().unwrap_or_default().to_string();
@@ -305,8 +360,6 @@ impl FilesWindow {
             })
             .detach();
     }
-
-    // ---------- загрузка ----------
 
     /// Перечитывает текущее место в фоне. `select` — что выделить после загрузки.
     fn load(&mut self, select: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -377,6 +430,10 @@ impl FilesWindow {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        // Во время поиска в списке находки: изменения в папке их не заменяют.
+        if self.search.is_some() {
+            return;
+        }
         self.load(Vec::new(), cx);
     }
 
@@ -447,13 +504,18 @@ impl FilesWindow {
         cx.spawn(async move |this, cx| {
             loop {
                 Timer::after(Duration::from_secs(2)).await;
-                let mounts = cx.background_executor().spawn(async { places::mounts() }).await;
+                let (mounts, remotes) =
+                    cx.background_executor().spawn(async { (places::mounts(), conchy_files::remote::mounted()) }).await;
                 let alive = this
                     .update(cx, |this, cx| {
                         // Сравниваем с точностью до мегабайта, чтобы не перерисовывать из-за логов.
                         let key = |m: &[Mount]| m.iter().map(|x| (x.device.clone(), x.free >> 20)).collect::<Vec<_>>();
                         if key(&this.mounts) != key(&mounts) {
                             this.mounts = mounts;
+                            cx.notify();
+                        }
+                        if this.remotes != remotes {
+                            this.remotes = remotes;
                             cx.notify();
                         }
                     })
@@ -465,8 +527,6 @@ impl FilesWindow {
         })
         .detach();
     }
-
-    // ---------- навигация ----------
 
     pub(crate) fn navigate(&mut self, target: Target, cx: &mut Context<Self>) {
         if target == self.location {
@@ -495,6 +555,10 @@ impl FilesWindow {
         self.anchor = None;
         self.location_edit = None;
         self.menu = None;
+        if let Some(s) = self.search.take() {
+            s.stop();
+        }
+        self.thumbs.clear();
         self.load_error = None;
         self.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.start_watch(cx);
@@ -581,26 +645,39 @@ impl FilesWindow {
             let msg = format!("Ссылка «{}» никуда не ведёт", e.name);
             self.notice(msg, cx);
         } else {
-            let _ = std::process::Command::new("xdg-open").arg(&e.path).spawn();
+            let p = e.path.clone();
+            self.open_files(vec![p], cx);
         }
     }
 
     fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_selection(cx);
+    }
+
+    /// Среди выделенного есть папка — переходим в неё; иначе открываем все файлы разом
+    /// (файлы одного типа уходят одной программе одним запуском).
+    pub(crate) fn open_selection(&mut self, cx: &mut Context<Self>) {
         let rows = self.selected_rows();
-        // Среди выделенного есть папка — переходим в неё; иначе открываем все файлы.
         if let Some(&dir_ix) = rows.iter().find(|&&i| self.rows[i].entry.is_dir) {
             return self.open_row(dir_ix, cx);
         }
-        for ix in rows {
-            self.open_row(ix, cx);
+        if self.in_trash() {
+            return self.notice("Чтобы открыть файл из корзины, сначала восстановите его", cx);
+        }
+        let files: Vec<PathBuf> = rows.iter().filter(|&&i| !self.rows[i].entry.broken).map(|&i| self.rows[i].entry.path.clone()).collect();
+        if !files.is_empty() {
+            self.open_files(files, cx);
         }
     }
-
-    // ---------- выделение ----------
 
     /// Индексы `rows` выделенных строк в порядке показа.
     pub(crate) fn selected_rows(&self) -> Vec<usize> {
         self.visible.iter().copied().filter(|&i| self.selected.contains(&self.rows[i].entry.path)).collect()
+    }
+
+    /// Шаг стрелок вверх-вниз: строка в списке, ряд плиток в сетке.
+    fn row_step(&self) -> isize {
+        if self.view_mode == grid::ViewMode::List { 1 } else { self.grid_cols.max(1) as isize }
     }
 
     fn cursor_pos(&self) -> Option<usize> {
@@ -676,6 +753,9 @@ impl FilesWindow {
         if self.dialog.is_some() {
             return self.on_dialog_key(ev, window, cx);
         }
+        if self.search.as_ref().is_some_and(|s| s.editing) {
+            return self.on_search_key(ev, cx);
+        }
         if self.location_edit.is_some() {
             return self.on_location_key(ev, cx);
         }
@@ -701,8 +781,6 @@ impl FilesWindow {
         cx.stop_propagation();
         cx.notify();
     }
-
-    // ---------- строка пути ----------
 
     fn edit_location(&mut self, _: &EditLocation, _: &mut Window, cx: &mut Context<Self>) {
         self.start_location_edit(cx);
@@ -758,7 +836,10 @@ impl FilesWindow {
         }
         let text = text.strip_prefix("file://").unwrap_or(text);
         if text.contains("://") {
-            return self.notice("Сетевые адреса будут на этапе 6 (sftp, smb через FUSE)", cx);
+            return match conchy_files::remote::Remote::parse(text) {
+                Some(r) => self.mount_remote(r, None, cx),
+                None => self.notice("Поддерживаются sftp://, smb://, ftp://, dav:// и davs://", cx),
+            };
         }
         let path = match text.strip_prefix('~') {
             Some(rest) => places::home().join(rest.trim_start_matches('/')),
@@ -781,12 +862,12 @@ impl FilesWindow {
         }
     }
 
-    // ---------- прочие действия ----------
-
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
         if self.menu.take().is_none() {
             if self.job.is_some() {
                 self.cancel_job();
+            } else if self.search.is_some() {
+                return self.exit_search(cx);
             } else {
                 self.selected.clear();
             }
@@ -853,22 +934,11 @@ fn read_location(
             })
             .collect(),
     };
-    let now = unsafe { libc::time(std::ptr::null_mut()) } as i64;
     let mut rows: Vec<Row> = entries
         .into_iter()
         .map(|e| {
             let (icon, kind) = icon_and_kind(&e, special);
-            let size = match e.items {
-                Some(n) if e.is_dir => items_label(n),
-                _ if e.is_dir => "—".into(),
-                _ => human_size(e.size),
-            };
-            let date = match &e.trash {
-                Some(t) if t.deleted > 0 => dir::format_date(t.deleted, now),
-                Some(_) => "—".into(),
-                None => dir::format_date(e.mtime, now),
-            };
-            Row { entry: e, icon, kind, size, date }
+            make_row(e, icon, kind)
         })
         .collect();
     dir::sort(&mut rows, sort);
@@ -883,6 +953,22 @@ fn sort_from(c: &FilesConfig) -> Sort {
         SortBy::Modified => SortKey::Modified,
     };
     Sort { key, ascending: c.sort_ascending, folders_first: c.folders_first }
+}
+
+/// Строка списка: подписи размера и даты готовятся сразу, чтобы отрисовка была дешёвой.
+fn make_row(e: Entry, icon: Option<PathBuf>, kind: String) -> Row {
+    let now = unsafe { libc::time(std::ptr::null_mut()) } as i64;
+    let size = match e.items {
+        Some(n) if e.is_dir => items_label(n),
+        _ if e.is_dir => "—".into(),
+        _ => human_size(e.size),
+    };
+    let date = match &e.trash {
+        Some(t) if t.deleted > 0 => dir::format_date(t.deleted, now),
+        Some(_) => "—".into(),
+        None => dir::format_date(e.mtime, now),
+    };
+    Row { entry: e, icon, kind, size, date }
 }
 
 /// Иконка и подпись колонки «Тип» (в корзине — исходная папка).
@@ -949,17 +1035,33 @@ impl Render for FilesWindow {
         self.update_title(window);
         self.sync_panel(cx);
         let panel = self.render_panel(cx);
-        let typing = self.dialog.is_some() || self.location_edit.is_some();
+        let sidebar = self.render_sidebar(cx).into_any_element();
+        let list = self.render_list(window, cx).into_any_element();
+        let typing = self.dialog.is_some() || self.location_edit.is_some() || self.search.as_ref().is_some_and(|s| s.editing);
         let menu = self.render_menu(window, cx);
         let dialog = self.render_dialog(cx);
         div()
             .key_context(if typing { CTX_TEXT } else { CTX })
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(1, false, cx)))
-            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_cursor(-1, false, cx)))
-            .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.move_cursor(1, true, cx)))
-            .on_action(cx.listener(|this, _: &ExtendPrev, _, cx| this.move_cursor(-1, true, cx)))
+            // В сетке вверх-вниз — на ряд, влево-вправо — на плитку; в списке влево-вправо не нужны.
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_cursor(this.row_step(), false, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.move_cursor(-this.row_step(), false, cx)))
+            .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.move_cursor(this.row_step(), true, cx)))
+            .on_action(cx.listener(|this, _: &ExtendPrev, _, cx| this.move_cursor(-this.row_step(), true, cx)))
+            .on_action(cx.listener(|this, _: &SelectRight, _, cx| {
+                if this.view_mode != grid::ViewMode::List {
+                    this.move_cursor(1, false, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectLeft, _, cx| {
+                if this.view_mode != grid::ViewMode::List {
+                    this.move_cursor(-1, false, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ViewIcons, _, cx| this.set_view(grid::ViewMode::Icons, cx)))
+            .on_action(cx.listener(|this, _: &ViewList, _, cx| this.set_view(grid::ViewMode::List, cx)))
+            .on_action(cx.listener(|this, _: &ViewCompact, _, cx| this.set_view(grid::ViewMode::Compact, cx)))
             .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.move_cursor(isize::MIN, false, cx)))
             .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.move_cursor(isize::MAX, false, cx)))
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.move_cursor(15, false, cx)))
@@ -989,7 +1091,8 @@ impl Render for FilesWindow {
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.run_cmd(actions::Cmd::Undo, cx)))
             .on_action(cx.listener(|this, _: &TogglePanel, _, cx| this.toggle_panel(cx)))
             .on_action(cx.listener(|this, _: &ShowPanel, _, cx| this.show_panel(cx)))
-            // Перетаскивание края нижней панели.
+            .on_action(cx.listener(|this, _: &StartSearch, _, cx| this.start_search(cx)))
+            .on_action(cx.listener(|this, _: &Redo, _, cx| this.run_cmd(actions::Cmd::Redo, cx)))
             .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
                 if let Some((y0, h0)) = this.panel.drag {
                     let max = (f32::from(window.viewport_size().height) - 180.0).max(140.0);
@@ -1007,7 +1110,6 @@ impl Render for FilesWindow {
                     }
                 }),
             )
-            // Боковые кнопки мыши «назад» и «вперёд».
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(|this, _: &MouseDownEvent, w, cx| this.go_back(&GoBack, w, cx)),
@@ -1023,7 +1125,7 @@ impl Render for FilesWindow {
             .text_color(rgb(TEXT))
             .text_size(px(self.config.font_size))
             .child(self.render_toolbar(cx))
-            .child(div().flex().flex_1().min_h_0().child(self.render_sidebar(cx)).child(self.render_list(cx)))
+            .child(div().flex().flex_1().min_h_0().child(sidebar).child(list))
             .children(panel)
             .child(self.render_status(cx))
             .children(menu)

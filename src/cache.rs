@@ -207,8 +207,6 @@ fn volume_id(device: &str) -> String {
         .unwrap_or_else(|| device.to_string())
 }
 
-// ---------- формат ----------
-
 fn put_var(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push(v as u8 | 0x80);

@@ -1,0 +1,4 @@
+# D-Bus запускает conchy-files по запросу «Показать в папке», даже если он не открыт.
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+Exec=/usr/bin/conchy-files --service

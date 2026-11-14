@@ -22,6 +22,9 @@ pub(super) enum Dialog {
     Confirm { title: String, body: String, ok: &'static str, action: ConfirmAction },
     Conflict { req: ConflictRequest, apply_all: bool },
     Errors { title: String, errors: Vec<(PathBuf, String)> },
+    OpenWith(super::openwith::OpenWith),
+    /// Пароль для сетевой папки.
+    Password { remote: conchy_files::remote::Remote, field: TextField, error: Option<String> },
 }
 
 pub(super) enum NamePurpose {
@@ -65,8 +68,6 @@ const MENU_W: f32 = 260.0;
 const MENU_ITEM_H: f32 = 26.0;
 
 impl FilesWindow {
-    // ---------- клавиатура ----------
-
     pub(super) fn on_dialog_key(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.dialog.is_none() {
             return;
@@ -78,7 +79,13 @@ impl FilesWindow {
             "enter" => return self.dialog_confirm(cx),
             _ => {}
         }
+        if matches!(self.dialog, Some(Dialog::OpenWith(_))) {
+            return self.open_with_key(ev, cx);
+        }
         match &mut self.dialog {
+            Some(Dialog::Password { field, .. }) => {
+                field.key(ks);
+            }
             Some(Dialog::Name { field, error, .. }) => {
                 let m = &ks.modifiers;
                 if (ks.key == "v" && m.control) || (ks.key == "insert" && m.shift) {
@@ -144,6 +151,10 @@ impl FilesWindow {
                 let resolution = if req.conflict.can_merge() { Resolution::Merge } else { Resolution::Replace };
                 let _ = req.reply.send(Answer { resolution, apply_to_all: apply_all });
             }
+            Some(Dialog::OpenWith(ow)) => self.open_with_confirm(ow, cx),
+            Some(Dialog::Password { remote, field, .. }) => {
+                self.mount_remote(remote, Some(field.text), cx);
+            }
             Some(Dialog::Errors { .. }) | None => {}
         }
         cx.notify();
@@ -155,8 +166,6 @@ impl FilesWindow {
         }
         cx.notify();
     }
-
-    // ---------- отрисовка диалогов ----------
 
     pub(super) fn render_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dialog = self.dialog.as_ref()?;
@@ -240,6 +249,23 @@ impl FilesWindow {
                             .child(button("ok", main, true, cx, |this, cx| this.dialog_confirm(cx))),
                     )
             }
+            Dialog::OpenWith(ow) => card_body()
+                .w(px(520.))
+                .child(self.render_open_with(ow, cx))
+                .child(
+                    buttons()
+                        .child(button("cancel", "Отмена", false, cx, |this, cx| this.dialog_cancel(cx)))
+                        .child(button("ok", "Открыть", true, cx, |this, cx| this.dialog_confirm(cx))),
+                ),
+            Dialog::Password { remote, field, error } => card(format!("Подключение к {}", remote.label()))
+                .child(div().text_color(rgb(DIM)).child("Сервер просит пароль. Он не сохраняется."))
+                .child(field.render_masked())
+                .when_some(error.clone(), |d, e| d.child(div().text_color(rgb(DANGER)).child(e)))
+                .child(
+                    buttons()
+                        .child(button("cancel", "Отмена", false, cx, |this, cx| this.dialog_cancel(cx)))
+                        .child(button("ok", "Подключить", true, cx, |this, cx| this.dialog_confirm(cx))),
+                ),
             Dialog::Errors { title, errors } => {
                 const SHOW: usize = 50;
                 let mut list = div().id("errors").flex().flex_col().gap_1().max_h(px(260.)).overflow_y_scroll();
@@ -276,8 +302,6 @@ impl FilesWindow {
                 .into_any_element(),
         )
     }
-
-    // ---------- контекстное меню ----------
 
     pub(super) fn render_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.menu.as_ref()?;
@@ -353,6 +377,10 @@ impl FilesWindow {
 }
 
 fn card(title: impl Into<String>) -> Div {
+    card_body().child(div().text_sm().font_weight(gpui::FontWeight::BOLD).child(title.into()))
+}
+
+fn card_body() -> Div {
     div()
         .w(px(480.))
         .max_w(gpui::relative(0.9))
@@ -366,7 +394,6 @@ fn card(title: impl Into<String>) -> Div {
         .rounded_lg()
         .shadow_lg()
         .text_color(rgb(TEXT))
-        .child(div().text_sm().font_weight(gpui::FontWeight::BOLD).child(title.into()))
 }
 
 fn info_box(text: &str) -> Div {

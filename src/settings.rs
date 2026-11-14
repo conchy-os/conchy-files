@@ -51,6 +51,11 @@ impl Settings {
         parse_files_config(&doc).map_err(|e| format!("{e:#}"))
     }
 
+    /// Пользовательские действия из блока `actions` (см. [`crate::uca`]).
+    pub fn actions(&self) -> Vec<crate::uca::CustomAction> {
+        self.store.load_document(CHANNEL).map(|d| crate::uca::parse(&d)).unwrap_or_default()
+    }
+
     /// Меняет одно значение (`view.show-hidden` = `true`). Вызывать не из потока интерфейса:
     /// обращение к D-Bus может ждать.
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {

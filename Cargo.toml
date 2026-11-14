@@ -9,9 +9,15 @@ anyhow = "1.0.104"
 conchy-config = { path = "../conchy-config" }
 # Запись настроек через демон org.conchy.Config (версия та же, что у conchy-config).
 zbus = "5"
+# Блок actions в files.kdl (та же версия, что у conchy-config).
+kdl = "4.6"
 futures = "0.3"
 gpui = "0.2.2"
 libc = "0.2"
+# Миниатюры по спецификации freedesktop (те же версии, что уже тянет GPUI).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+png = "0.18"
+md-5 = "0.10"
 # Сжатие дискового кеша анализа (чистый Rust, без C).
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 rayon = "1.12.0"

@@ -168,7 +168,7 @@ fn parse_info(body: &str) -> Option<(PathBuf, i64)> {
     let mut deleted = 0;
     for line in body.lines() {
         if let Some(p) = line.strip_prefix("Path=") {
-            path = Some(PathBuf::from(OsString::from_vec(percent_decode(p))));
+            path = Some(PathBuf::from(OsString::from_vec(crate::percent_decode(p))));
         } else if let Some(d) = line.strip_prefix("DeletionDate=") {
             deleted = parse_local_time(d).unwrap_or(0);
         }
@@ -194,25 +194,6 @@ fn parse_local_time(s: &str) -> Option<i64> {
     tm.tm_isdst = -1;
     let r = unsafe { libc::mktime(&mut tm) };
     (r != -1).then_some(r as i64)
-}
-
-fn percent_decode(s: &str) -> Vec<u8> {
-    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
 }
 
 fn home_trash_dir() -> io::Result<PathBuf> {
