@@ -156,11 +156,24 @@ impl Tree {
         let kind = if raw.is_dir {
             None
         } else {
-            let ext = extension(&raw.name);
-            let idx = *ext_index.entry(ext.clone()).or_insert_with(|| {
-                types.push(TypeStat { ext, size: 0, files: 0 });
-                (types.len() - 1) as u16
-            });
+            // Горячий путь: сотни тысяч файлов. Без выделения памяти, пока тип уже известен.
+            let ext = extension_slice(&raw.name);
+            let lower;
+            let ext = if ext.bytes().any(|b| b.is_ascii_uppercase()) {
+                lower = ext.to_ascii_lowercase();
+                lower.as_str()
+            } else {
+                ext
+            };
+            let idx = match ext_index.get(ext) {
+                Some(&i) => i,
+                None => {
+                    let i = types.len() as u16;
+                    types.push(TypeStat { ext: ext.into(), size: 0, files: 0 });
+                    ext_index.insert(ext.into(), i);
+                    i
+                }
+            };
             let t = &mut types[idx as usize];
             t.size += raw.size;
             t.files += 1;
@@ -233,6 +246,11 @@ impl Tree {
 /// Числовые хвосты версий пропускаются, если перед ними есть настоящее расширение:
 /// `libfoo.so.12.0` → `so`, но `data.046` → `046`.
 pub fn extension(name: &str) -> Box<str> {
+    extension_slice(name).to_ascii_lowercase().into()
+}
+
+/// То же, что [`extension`], но срезом исходного имени, без смены регистра.
+fn extension_slice(name: &str) -> &str {
     fn last(s: &str) -> Option<&str> {
         match s.rfind('.') {
             Some(0) | None => None,
@@ -241,7 +259,7 @@ pub fn extension(name: &str) -> Box<str> {
         }
     }
     let is_num = |e: &str| e.bytes().all(|b| b.is_ascii_digit());
-    let Some(first) = last(name) else { return "".into() };
+    let Some(first) = last(name) else { return "" };
     let mut rest = name;
     let mut ext = first;
     while is_num(ext) {
@@ -249,10 +267,10 @@ pub fn extension(name: &str) -> Box<str> {
         match last(rest) {
             Some(e) => ext = e,
             // Настоящего расширения нет — оставляем числовое как есть.
-            None => return first.to_ascii_lowercase().into(),
+            None => return first,
         }
     }
-    ext.to_ascii_lowercase().into()
+    ext
 }
 
 /// Человекочитаемый размер: `1536` → `1.5 КБ`.
