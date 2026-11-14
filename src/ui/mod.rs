@@ -4,6 +4,7 @@
 mod actions;
 mod dialogs;
 mod field;
+mod panel;
 mod view;
 
 use std::collections::{HashMap, HashSet};
@@ -31,7 +32,8 @@ actions!(
     [
         SelectNext, SelectPrev, ExtendNext, ExtendPrev, SelectFirst, SelectLast, PageDown, PageUp, OpenSelected,
         GoBack, GoForward, GoUp, GoHome, EditLocation, ToggleHidden, Reload, CloseWindow, SelectAll, Escape,
-        CutFiles, CopyFiles, PasteFiles, RenameItem, NewFolder, TrashFiles, DeleteFiles, Undo
+        CutFiles, CopyFiles, PasteFiles, RenameItem, NewFolder, TrashFiles, DeleteFiles, Undo, TogglePanel,
+        ShowPanel
     ]
 );
 
@@ -75,6 +77,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", TrashFiles, Some(CTX)),
         KeyBinding::new("shift-delete", DeleteFiles, Some(CTX)),
         KeyBinding::new("ctrl-z", Undo, Some(CTX)),
+        // Нижняя панель: анализ места и свойства (в Thunar Alt+Enter — «Свойства»).
+        KeyBinding::new("ctrl-i", TogglePanel, Some(CTX)),
+        KeyBinding::new("alt-enter", ShowPanel, Some(CTX)),
     ]);
 }
 
@@ -140,6 +145,7 @@ pub struct FilesWindow {
     settings: Arc<Settings>,
     config: FilesConfig,
     _config_watch: Option<watch::Watch>,
+    panel: panel::PanelState,
 
     clipboard: Option<Clip>,
     undo: Vec<conchy_files::ops::Record>,
@@ -203,6 +209,7 @@ impl FilesWindow {
             settings,
             config,
             _config_watch: None,
+            panel: Default::default(),
             clipboard: None,
             undo: Vec::new(),
             job: None,
@@ -210,6 +217,9 @@ impl FilesWindow {
             menu: None,
             notice: None,
         };
+        this.configure_cache(cx);
+        // Окно закрывают — дописываем на диск то, что ещё не записано.
+        cx.on_release(|this, _| this.flush_cache_now()).detach();
         this.set_location(location, select, cx);
         this.poll_mounts(cx);
         this.watch_config(cx);
@@ -255,6 +265,10 @@ impl FilesWindow {
         }
         let old = std::mem::replace(&mut self.config, c);
         let mut reload = old.folder_size != self.config.folder_size;
+        let cache_cfg = |c: &FilesConfig| (c.cache_enabled, c.cache_max_mb, c.cache_max_age_days);
+        if cache_cfg(&old) != cache_cfg(&self.config) {
+            self.configure_cache(cx);
+        }
         if old.icon_theme != self.config.icon_theme && icons::set_theme(self.config.icon_theme.as_deref()) {
             reload = true;
         }
@@ -275,6 +289,7 @@ impl FilesWindow {
         if reload {
             self.reload(cx);
         }
+        self.sync_panel(cx);
         self.notice("Настройки из files.kdl применены", cx);
         cx.notify();
     }
@@ -311,6 +326,7 @@ impl FilesWindow {
             let _ = this.update(cx, |this, cx| {
                 if this.load_gen == generation {
                     this.apply_load(res, select);
+                    this.apply_deep_sizes();
                     this.refine_types(cx);
                     cx.notify();
                 }
@@ -931,6 +947,8 @@ fn complete_path(text: &str) -> Option<String> {
 impl Render for FilesWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_title(window);
+        self.sync_panel(cx);
+        let panel = self.render_panel(cx);
         let typing = self.dialog.is_some() || self.location_edit.is_some();
         let menu = self.render_menu(window, cx);
         let dialog = self.render_dialog(cx);
@@ -969,6 +987,26 @@ impl Render for FilesWindow {
             .on_action(cx.listener(|this, _: &TrashFiles, _, cx| this.run_cmd(actions::Cmd::Trash, cx)))
             .on_action(cx.listener(|this, _: &DeleteFiles, _, cx| this.run_cmd(actions::Cmd::Delete, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.run_cmd(actions::Cmd::Undo, cx)))
+            .on_action(cx.listener(|this, _: &TogglePanel, _, cx| this.toggle_panel(cx)))
+            .on_action(cx.listener(|this, _: &ShowPanel, _, cx| this.show_panel(cx)))
+            // Перетаскивание края нижней панели.
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                if let Some((y0, h0)) = this.panel.drag {
+                    let max = (f32::from(window.viewport_size().height) - 180.0).max(140.0);
+                    let h = (h0 + y0 - f32::from(ev.position.y)).clamp(120.0, max);
+                    this.config.panel_height = h as u32;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    if this.panel.drag.take().is_some() {
+                        let h = this.config.panel_height.to_string();
+                        this.save_settings(vec![("panel.height", h)], cx);
+                    }
+                }),
+            )
             // Боковые кнопки мыши «назад» и «вперёд».
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
@@ -986,6 +1024,7 @@ impl Render for FilesWindow {
             .text_size(px(self.config.font_size))
             .child(self.render_toolbar(cx))
             .child(div().flex().flex_1().min_h_0().child(self.render_sidebar(cx)).child(self.render_list(cx)))
+            .children(panel)
             .child(self.render_status(cx))
             .children(menu)
             .children(dialog)

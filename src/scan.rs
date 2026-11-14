@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rayon::prelude::*;
 
 /// Узел, собранный сканером. Потом превращается в плоское дерево [`crate::model::Tree`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RawNode {
     pub name: Box<str>,
     pub is_dir: bool,

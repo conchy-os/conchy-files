@@ -86,6 +86,12 @@ impl FilesWindow {
             ))
             .child(div().w(px(6.)))
             .child(self.render_location(cx))
+            .child(div().w(px(6.)))
+            .child(
+                nav("panel", "document-properties", "ⓘ", true, "Анализ места и свойства (Ctrl+I)")
+                    .when(self.config.panel_visible, |d| d.bg(rgb(SEL_BG)))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_panel(cx))),
+            )
     }
 
     /// Путь кнопками, как в Thunar; по `Ctrl+L` или щелчку по пустому месту — поле ввода.
@@ -393,10 +399,10 @@ impl FilesWindow {
                 s
             }
         } else if sel.len() > 1 {
-            let size: u64 = sel.iter().map(|&i| self.rows[i].entry.size).sum();
+            let size: u64 = sel.iter().map(|&i| total_size(&self.rows[i].entry)).sum();
             format!("Выбрано: {}  ({})", items_label(sel.len() as u64), human_size(size))
         } else {
-            let size: u64 = self.visible.iter().map(|&i| self.rows[i].entry.size).sum();
+            let size: u64 = self.visible.iter().map(|&i| total_size(&self.rows[i].entry)).sum();
             let mut s = format!("{}  ({})", items_label(self.visible.len() as u64), human_size(size));
             if let Some((_, free)) = self.space {
                 s.push_str(&format!(",  свободно: {}", human_size(free)));
@@ -544,6 +550,11 @@ fn progress_bar(frac: f32, w: f32) -> impl IntoElement {
         .rounded_sm()
         .bg(rgb(BORDER))
         .child(div().absolute().top_0().left_0().h_full().rounded_sm().bg(rgb(ACCENT)).w(px(w * frac.clamp(0.0, 1.0))))
+}
+
+/// Размер с содержимым: у папки — посчитанный анализом, если он уже есть.
+fn total_size(e: &conchy_files::dir::Entry) -> u64 {
+    e.deep_size.unwrap_or(e.size)
 }
 
 fn cell(w: f32) -> gpui::Div {

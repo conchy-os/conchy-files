@@ -45,6 +45,9 @@ pub(super) enum Cmd {
     CopyPath,
     ToggleHidden,
     SelectAll,
+    /// Нижняя панель: открыть (свойства выделенного) или переключить.
+    ShowPanel,
+    TogglePanel,
 }
 
 /// Что лежит в буфере обмена приложения.
@@ -257,6 +260,8 @@ impl FilesWindow {
             }
             Cmd::ToggleHidden => self.toggle_hidden(cx),
             Cmd::SelectAll => self.select_all(cx),
+            Cmd::ShowPanel => self.show_panel(cx),
+            Cmd::TogglePanel => self.toggle_panel(cx),
         }
         cx.notify();
     }
@@ -345,6 +350,8 @@ impl FilesWindow {
                 None,
                 Some(MenuItem::new("Переименовать…", "F2", Cmd::Rename, single)),
                 Some(MenuItem::new("Копировать путь", "", Cmd::CopyPath, true)),
+                None,
+                Some(MenuItem::new(if single_dir { "Анализ места" } else { "Свойства" }, "Alt+Enter", Cmd::ShowPanel, true)),
             ]
         };
         self.menu = Some(Menu { pos, items: compact(items) });
@@ -375,6 +382,13 @@ impl FilesWindow {
                 )),
                 None,
                 Some(MenuItem::new(undo.clone().unwrap_or_else(|| "Отменить".into()), "Ctrl+Z", Cmd::Undo, undo.is_some())),
+                None,
+                Some(MenuItem::new(
+                    if self.config.panel_visible { "Скрыть панель анализа" } else { "Анализ места" },
+                    "Ctrl+I",
+                    Cmd::TogglePanel,
+                    true,
+                )),
             ]
         };
         self.menu = Some(Menu { pos, items: compact(items) });
@@ -470,6 +484,8 @@ impl FilesWindow {
             (_, Some(r)) => new_paths(r),
             _ => Vec::new(),
         };
+        // Деревья анализа места обновляем точечно, без полного пересканирования.
+        self.patch_analyses(out.touched.clone(), cx);
         let here: Vec<PathBuf> = match &self.location {
             Target::Dir(d) => select.into_iter().filter(|p| p.parent() == Some(d.as_path())).collect(),
             Target::Trash => Vec::new(),

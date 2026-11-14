@@ -1,3 +1,5 @@
+pub mod analysis;
+pub mod cache;
 pub mod dir;
 pub mod icons;
 pub mod layout;

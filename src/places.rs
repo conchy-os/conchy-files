@@ -182,6 +182,17 @@ pub fn mounts() -> Vec<Mount> {
     out
 }
 
+/// Раздел, на котором лежит `path`: (устройство, точка монтирования).
+/// Берётся самая длинная подходящая точка монтирования.
+pub fn mount_of(path: &Path) -> Option<(String, PathBuf)> {
+    let s = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    parse_mountinfo(&s)
+        .into_iter()
+        .filter(|m| path.starts_with(&m.1))
+        .max_by_key(|m| m.1.as_os_str().len())
+        .map(|m| (m.0, m.1))
+}
+
 /// (устройство, точка монтирования, тип ФС) из `/proc/self/mountinfo`.
 fn parse_mountinfo(s: &str) -> Vec<(String, PathBuf, String)> {
     s.lines()

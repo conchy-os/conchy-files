@@ -24,6 +24,8 @@ pub struct Entry {
     pub mime: String,
     /// Для папки — сколько в ней элементов (`None`, если нет доступа).
     pub items: Option<u64>,
+    /// Для папки — полный размер содержимого, если он уже посчитан анализом места.
+    pub deep_size: Option<u64>,
     /// Только для содержимого корзины.
     pub trash: Option<TrashInfo>,
 }
@@ -74,6 +76,7 @@ impl Entry {
             mode: meta.mode(),
             mime,
             items,
+            deep_size: None,
             trash: None,
         })
     }
@@ -126,7 +129,11 @@ pub fn sort<T: AsRef<Entry>>(items: &mut [T], s: Sort) {
             SortKey::Name => Ordering::Equal,
             SortKey::Size => {
                 if a.is_dir && b.is_dir {
-                    a.items.cmp(&b.items)
+                    // Настоящий размер, если известен, иначе число элементов.
+                    match (a.deep_size, b.deep_size) {
+                        (Some(x), Some(y)) => x.cmp(&y),
+                        _ => a.items.cmp(&b.items),
+                    }
                 } else {
                     a.size.cmp(&b.size)
                 }
@@ -201,6 +208,30 @@ pub fn format_date(t: i64, now: i64) -> String {
     }
 }
 
+/// Имя пользователя по uid (`/etc/passwd` через libc), иначе число.
+pub fn user_name(uid: u32) -> String {
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r == 0 && !out.is_null() {
+        return unsafe { std::ffi::CStr::from_ptr(pw.pw_name) }.to_string_lossy().into_owned();
+    }
+    uid.to_string()
+}
+
+/// Имя группы по gid, иначе число.
+pub fn group_name(gid: u32) -> String {
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::group = std::ptr::null_mut();
+    let r = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r == 0 && !out.is_null() {
+        return unsafe { std::ffi::CStr::from_ptr(gr.gr_name) }.to_string_lossy().into_owned();
+    }
+    gid.to_string()
+}
+
 /// `rwxr-xr-x` из `st_mode`.
 pub fn mode_string(mode: u32) -> String {
     let mut s = String::with_capacity(9);
@@ -258,5 +289,7 @@ mod tests {
         assert!(format_date(now - 86_400 * 30, now).contains('.'));
         assert_eq!(mode_string(0o100755), "rwxr-xr-x");
         assert_eq!(mode_string(0o640), "rw-r-----");
+        assert_eq!(user_name(0), "root");
+        assert_eq!(user_name(4_000_000_000), "4000000000");
     }
 }
