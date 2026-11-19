@@ -131,6 +131,15 @@ fn describe(path: &Path) -> String {
 impl FilesWindow {
     pub(super) fn run_cmd(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
         self.menu = None;
+        // В пикере файлы не меняют и не открывают сторонними программами: только выбор.
+        if self.pick.is_some()
+            && !matches!(
+                cmd,
+                Cmd::Open | Cmd::Copy | Cmd::NewFolder | Cmd::CopyPath | Cmd::ToggleHidden | Cmd::SelectAll | Cmd::View(_)
+            )
+        {
+            return;
+        }
         let trash = self.in_trash();
         match cmd {
             Cmd::Open => self.open_selection(cx),
@@ -418,7 +427,7 @@ impl FilesWindow {
             self.menu_targets = sel.into_iter().map(|(p, ..)| p).collect();
             items
         };
-        self.menu = Some(Menu { pos, items: compact(items) });
+        self.menu = Some(Menu { pos, items: compact(self.pick_menu(items)) });
         cx.notify();
     }
 
@@ -481,7 +490,7 @@ impl FilesWindow {
             }
             self.menu_targets = vec![cwd];
         }
-        self.menu = Some(Menu { pos, items: compact(items) });
+        self.menu = Some(Menu { pos, items: compact(self.pick_menu(items)) });
         cx.notify();
     }
 

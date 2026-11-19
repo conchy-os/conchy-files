@@ -10,6 +10,7 @@ mod grid;
 mod network;
 mod openwith;
 mod panel;
+mod picker;
 mod search;
 mod view;
 
@@ -28,6 +29,8 @@ use gpui::{
     App, Context, FocusHandle, KeyBinding, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, NavigationDirection,
     ScrollStrategy, Task, Timer, UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb,
 };
+
+pub use picker::{cancel_pick, open_picker};
 
 use actions::{Clip, Job};
 use dialogs::{Dialog, Menu};
@@ -189,6 +192,8 @@ pub struct FilesWindow {
     dialog: Option<Dialog>,
     menu: Option<Menu>,
     notice: Option<(String, Instant)>,
+    /// Режим пикера файлов (портал FileChooser); `None` — обычный файловый менеджер.
+    pick: Option<picker::PickState>,
 }
 
 impl FilesWindow {
@@ -267,6 +272,7 @@ impl FilesWindow {
             dialog: None,
             menu: None,
             notice: None,
+            pick: None,
         };
         this.configure_cache(cx);
         this.custom = this.settings.actions();
@@ -423,6 +429,10 @@ impl FilesWindow {
                         r.kind = kind;
                     }
                 }
+                // Тип уточнился — фильтр пикера мог измениться.
+                if this.pick.is_some() {
+                    this.rebuild_visible();
+                }
                 cx.notify();
             });
         })
@@ -473,7 +483,9 @@ impl FilesWindow {
 
     fn rebuild_visible(&mut self) {
         let hidden = self.show_hidden;
-        self.visible = (0..self.rows.len()).filter(|&i| hidden || !self.rows[i].entry.is_hidden()).collect();
+        self.visible = (0..self.rows.len())
+            .filter(|&i| (hidden || !self.rows[i].entry.is_hidden()) && !self.pick_hides(&self.rows[i].entry))
+            .collect();
     }
 
     pub(crate) fn resort(&mut self, key: SortKey, cx: &mut Context<Self>) {
@@ -637,6 +649,9 @@ impl FilesWindow {
         if self.in_trash() {
             return self.notice("Чтобы открыть файл из корзины, сначала восстановите его", cx);
         }
+        if self.pick_open_row(ix, cx) {
+            return;
+        }
         let e = &self.rows[ix].entry;
         if e.is_dir {
             let p = e.path.clone();
@@ -657,6 +672,9 @@ impl FilesWindow {
     /// Среди выделенного есть папка — переходим в неё; иначе открываем все файлы разом
     /// (файлы одного типа уходят одной программе одним запуском).
     pub(crate) fn open_selection(&mut self, cx: &mut Context<Self>) {
+        if self.pick.is_some() {
+            return self.pick_enter(cx);
+        }
         let rows = self.selected_rows();
         if let Some(&dir_ix) = rows.iter().find(|&&i| self.rows[i].entry.is_dir) {
             return self.open_row(dir_ix, cx);
@@ -693,6 +711,9 @@ impl FilesWindow {
 
     /// Нажатие на строку `pos` (позиция в видимом списке) с учётом Ctrl и Shift.
     pub(crate) fn click_row(&mut self, pos: usize, m: Modifiers) {
+        // Пикер без мультивыбора: Ctrl и Shift не расширяют выделение.
+        let m = if self.pick_single_only() { Modifiers::default() } else { m };
+        self.pick_clicked(self.visible[pos]);
         let path = self.rows[self.visible[pos]].entry.path.clone();
         if m.shift {
             self.select_range(pos);
@@ -752,6 +773,9 @@ impl FilesWindow {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.dialog.is_some() {
             return self.on_dialog_key(ev, window, cx);
+        }
+        if self.on_pick_key(ev, cx) {
+            return;
         }
         if self.search.as_ref().is_some_and(|s| s.editing) {
             return self.on_search_key(ev, cx);
@@ -864,6 +888,9 @@ impl FilesWindow {
 
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
         if self.menu.take().is_none() {
+            if self.search.is_none() && self.job.is_none() && self.pick_escape(cx) {
+                return;
+            }
             if self.job.is_some() {
                 self.cancel_job();
             } else if self.search.is_some() {
@@ -901,7 +928,10 @@ impl FilesWindow {
     }
 
     fn update_title(&mut self, window: &mut Window) {
-        let title = format!("{} — conchy-files", self.location_title());
+        let title = match self.pick_title() {
+            Some(t) => t,
+            None => format!("{} — conchy-files", self.location_title()),
+        };
         if title != self.title {
             window.set_window_title(&title);
             self.title = title;
@@ -1033,11 +1063,16 @@ fn complete_path(text: &str) -> Option<String> {
 impl Render for FilesWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_title(window);
+        self.pick_frame_drawn();
         self.sync_panel(cx);
-        let panel = self.render_panel(cx);
+        let panel = if self.pick.is_some() { None } else { self.render_panel(cx) };
+        let pick_bar = self.render_pick_bar(cx);
         let sidebar = self.render_sidebar(cx).into_any_element();
         let list = self.render_list(window, cx).into_any_element();
-        let typing = self.dialog.is_some() || self.location_edit.is_some() || self.search.as_ref().is_some_and(|s| s.editing);
+        let typing = self.dialog.is_some()
+            || self.location_edit.is_some()
+            || self.search.as_ref().is_some_and(|s| s.editing)
+            || self.pick.as_ref().is_some_and(|p| p.name_focus);
         let menu = self.render_menu(window, cx);
         let dialog = self.render_dialog(cx);
         div()
@@ -1127,6 +1162,7 @@ impl Render for FilesWindow {
             .child(self.render_toolbar(cx))
             .child(div().flex().flex_1().min_h_0().child(sidebar).child(list))
             .children(panel)
+            .children(pick_bar)
             .child(self.render_status(cx))
             .children(menu)
             .children(dialog)

@@ -167,7 +167,7 @@ impl FilesWindow {
     /// Запускает то, что нужно панели для текущего выделения: сканирование папки
     /// или чтение начала текстового файла. Можно звать сколько угодно раз.
     pub(super) fn sync_panel(&mut self, cx: &mut Context<Self>) {
-        if !self.config.panel_visible {
+        if !self.config.panel_visible || self.pick.is_some() {
             return;
         }
         match self.panel_target() {

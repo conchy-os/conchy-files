@@ -1,10 +1,14 @@
 mod ui;
 
 use std::borrow::Cow;
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use conchy_files::instance::{self, Request};
+use conchy_files::portal_host::HostEvent;
 use conchy_files::settings::Settings;
 use futures::StreamExt;
 use gpui::{App, Application, AssetSource, Bounds, SharedString, WindowBounds, WindowOptions, prelude::*, px, size};
@@ -31,20 +35,28 @@ const HELP: &str = "conchy-files — файловый менеджер Conchy OS
   --select ПУТЬ показать элемент в его папке
   --service     запуск через D-Bus (org.freedesktop.FileManager1): без окна,
                 ждать запроса; без запроса выйти через 30 секунд
+  --resident    резидентный режим для порталов (org.conchy.Portal.FilesHost): остаётся после
+                закрытия окон и держит прогретые кеши, для этого висит невидимое окно
+                `conchy-files-keepalive` (нужно правило wm: плавающее, без фокуса); выходит,
+                если 15 минут нет окон и запросов (CONCHY_FILES_IDLE_SECS).
+                Без него порталы поднимают conchy-files через D-Bus (--service) на каждый запрос.
   -h, --help    эта справка
 
 Если программа уже запущена, новое окно открывает работающий процесс.
-Когда закрыто последнее окно, процесс завершается и освобождает память.
+Когда закрыто последнее окно, процесс завершается и освобождает память
+(кроме режима --resident).
 Настройки: ~/.config/conchy/files.kdl";
 
 fn main() {
     let mut service = false;
+    let mut resident = false;
     let mut reqs = Vec::new();
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         let s = a.to_string_lossy();
         match s.as_ref() {
             "--service" => service = true,
+            "--resident" => resident = true,
             "-h" | "--help" => return println!("{HELP}"),
             "--select" => {
                 if let Some(p) = args.next().and_then(|p| instance::arg_to_path(&p.to_string_lossy())) {
@@ -59,7 +71,7 @@ fn main() {
             },
         }
     }
-    if reqs.is_empty() && !service {
+    if reqs.is_empty() && !service && !resident {
         reqs.push(Request::Open(conchy_files::places::home()));
     }
 
@@ -80,6 +92,16 @@ fn main() {
     if let Err(e) = settings.load() {
         eprintln!("conchy-files: {}: {e}", settings.path().display());
     }
+
+    // Хост UI для демона порталов. Имя занимаем ДО инициализации GPUI (она долгая): демон ждёт
+    // активации не больше 2 секунд, а запросы пока копятся в канале.
+    let (host_tx, host_rx) = futures::channel::mpsc::unbounded::<HostEvent>();
+    match conchy_files::portal_host::serve(host_tx) {
+        Ok(conn) => std::mem::forget(conn),
+        // Имя занято (другой экземпляр conchy-files) — пикеры откроет он.
+        Err(e) => eprintln!("conchy-files: FilesHost не запущен: {e}"),
+    }
+    let mut host_rx = host_rx;
 
     Application::new().with_assets(FsAssets).run(move |cx: &mut App| {
         ui::bind_keys(cx);
@@ -102,6 +124,22 @@ fn main() {
         if let Ok(conn) = fm {
             std::mem::forget(conn);
         }
+        let activity = Rc::new(Cell::new(Instant::now()));
+        {
+            let s = settings.clone();
+            let activity = activity.clone();
+            cx.spawn(async move |cx| {
+                while let Some(ev) = host_rx.next().await {
+                    activity.set(Instant::now());
+                    let s = s.clone();
+                    let _ = cx.update(|cx| match ev {
+                        HostEvent::Pick { id, req, reply } => ui::open_picker(cx, id, *req, reply, &s),
+                        HostEvent::Cancel { id } => ui::cancel_pick(cx, &id),
+                    });
+                }
+            })
+            .detach();
+        }
 
         for r in reqs.drain(..) {
             open_window(cx, r, &settings);
@@ -119,12 +157,50 @@ fn main() {
 
         // Последнее окно закрыто — выходим. (GPUI под Wayland и сам останавливает
         // цикл событий без окон, поэтому «вечного» фонового режима нет.)
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
+        cx.on_window_closed(move |cx| {
+            if cx.windows().is_empty() && !resident {
                 cx.quit();
             }
         })
         .detach();
+        if resident {
+            // GPUI на Wayland останавливает цикл событий, когда не осталось ни одного окна
+            // (gpui/src/platform/linux/wayland/client.rs), а нам нужен тёплый процесс. Держим
+            // крошечное прозрачное окно; wm даёт ему правило по app_id `conchy-files-keepalive`.
+            let _ = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1.), px(1.)), cx))),
+                    app_id: Some("conchy-files-keepalive".into()),
+                    titlebar: None,
+                    focus: false,
+                    show: false,
+                    is_movable: false,
+                    is_resizable: false,
+                    is_minimizable: false,
+                    window_background: gpui::WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|_| KeepAlive),
+            );
+            // Освобождаем память, если порталы давно не нужны: следующий запрос запустит процесс заново.
+            let idle = std::env::var("CONCHY_FILES_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(900u64);
+            let activity = activity.clone();
+            cx.spawn(async move |cx| {
+                loop {
+                    gpui::Timer::after(Duration::from_secs(idle.clamp(1, 60))).await;
+                    let quit = cx
+                        .update(|cx| {
+                            cx.windows().len() <= 1 && activity.get().elapsed() >= Duration::from_secs(idle)
+                        })
+                        .unwrap_or(true);
+                    if quit {
+                        let _ = cx.update(|cx| cx.quit());
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         if service {
             // Запустили ради запроса D-Bus, а он не пришёл (или уже обработан другим) — не висим.
             cx.spawn(async move |cx| {
@@ -139,7 +215,18 @@ fn main() {
         }
         cx.activate(true);
     });
+    // Ответ D-Bus уходит из отдельного потока zbus: даём ему долететь до выхода.
+    std::thread::sleep(Duration::from_millis(100));
     let _ = std::fs::remove_file(&socket);
+}
+
+/// Пустое невидимое окно-якорь резидентного режима.
+struct KeepAlive;
+
+impl Render for KeepAlive {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        gpui::div().size_full()
+    }
 }
 
 fn absolute(p: PathBuf) -> PathBuf {

@@ -33,6 +33,8 @@ pub struct MimeDb {
     /// Остальные шаблоны: `README*`, `*.[ch]`.
     patterns: Vec<(u32, String, String)>,
     aliases: HashMap<String, String>,
+    /// `mime/subclasses`: тип → его прямые родители (`text/x-csrc` → `text/plain`).
+    parents: HashMap<String, Vec<String>>,
     generic_icons: HashMap<String, String>,
     dirs: Vec<PathBuf>,
     comments: Mutex<HashMap<String, String>>,
@@ -76,6 +78,9 @@ impl MimeDb {
                     db.aliases.insert(a.to_string(), b.to_string());
                 }
             }
+            if let Ok(s) = fs::read_to_string(m.join("subclasses")) {
+                db.add_subclasses(&s);
+            }
             if let Ok(s) = fs::read_to_string(m.join("generic-icons")) {
                 for (a, b) in s.lines().filter_map(|l| l.split_once(':')) {
                     db.generic_icons.insert(a.to_string(), b.to_string());
@@ -84,6 +89,50 @@ impl MimeDb {
             db.dirs.insert(0, m);
         }
         db
+    }
+
+    fn add_subclasses(&mut self, text: &str) {
+        for (child, parent) in text.lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.split_once(' ')) {
+            let v = self.parents.entry(child.trim().to_string()).or_default();
+            let parent = parent.trim().to_string();
+            if !v.contains(&parent) {
+                v.push(parent);
+            }
+        }
+    }
+
+    /// `mime` — это `parent` или его подкласс (по `mime/subclasses`, с учётом алиасов).
+    /// Дополнительно, как в спецификации: любой `text/*` — подкласс `text/plain`,
+    /// `*+xml` — подкласс `application/xml`, а всё, что не папка, — `application/octet-stream`.
+    pub fn is_a(&self, mime: &str, parent: &str) -> bool {
+        let (mime, parent) = (self.unalias(mime), self.unalias(parent));
+        if mime == parent {
+            return true;
+        }
+        if parent == "application/octet-stream" {
+            return mime != DIRECTORY;
+        }
+        if parent == "text/plain" && mime.starts_with("text/") {
+            return true;
+        }
+        if parent == "application/xml" && mime.ends_with("+xml") {
+            return true;
+        }
+        let mut seen: Vec<&str> = vec![mime];
+        let mut stack: Vec<&str> = vec![mime];
+        while let Some(m) = stack.pop() {
+            for p in self.parents.get(m).into_iter().flatten() {
+                let p = self.unalias(p);
+                if p == parent {
+                    return true;
+                }
+                if !seen.contains(&p) {
+                    seen.push(p);
+                    stack.push(p);
+                }
+            }
+        }
+        false
     }
 
     fn add_globs2(&mut self, text: &str) {
@@ -327,6 +376,21 @@ mod tests {
         assert_eq!(db.by_name("noext"), None);
         assert_eq!(db.icon_names("application/gzip"), ["application-gzip", "package-x-generic", "application-x-generic", "text-x-generic"]);
         assert_eq!(db.icon_names(DIRECTORY), ["inode-directory", "folder"]);
+    }
+
+    #[test]
+    fn subclasses_are_transitive() {
+        let mut db = test_db();
+        db.add_subclasses("text/x-csrc text/x-chdr\ntext/x-chdr text/plain\napplication/x-gzip-thing application/gzip\n");
+        db.aliases.insert("application/x-gzip".into(), "application/gzip".into());
+        assert!(db.is_a("text/x-csrc", "text/x-csrc"));
+        assert!(db.is_a("text/x-csrc", "text/x-chdr"));
+        assert!(db.is_a("application/x-gzip-thing", "application/x-gzip"), "алиас родителя");
+        assert!(db.is_a("text/anything", "text/plain"));
+        assert!(db.is_a("image/svg+xml", "application/xml"));
+        assert!(db.is_a("image/png", "application/octet-stream"));
+        assert!(!db.is_a(DIRECTORY, "application/octet-stream"));
+        assert!(!db.is_a("image/png", "text/plain"));
     }
 
     #[test]

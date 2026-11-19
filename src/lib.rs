@@ -11,6 +11,8 @@ pub mod mime;
 pub mod model;
 pub mod notify;
 pub mod ops;
+pub mod pick;
+pub mod portal_host;
 pub mod places;
 pub mod remote;
 pub mod scan;

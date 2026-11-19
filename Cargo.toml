@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = "1.0.104"
 # Единый KDL-конфиг Conchy OS: канал `files` (~/.config/conchy/files.kdl).
 conchy-config = { path = "../conchy-config" }
+# Типы запросов пикера файлов (портал FileChooser): общий крейт с демоном xdg-desktop-portal-conchy.
+conchy-portal-proto = { path = "../conchy-portal/crates/proto" }
 # Запись настроек через демон org.conchy.Config (версия та же, что у conchy-config).
 zbus = "5"
 # Блок actions в files.kdl (та же версия, что у conchy-config).

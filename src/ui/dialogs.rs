@@ -37,6 +37,8 @@ pub(super) enum ConfirmAction {
     Delete(Vec<PathBuf>),
     /// Удалить из корзины (в том числе «Очистить корзину»).
     Erase(Vec<TrashedItem>),
+    /// Пикер: заменить существующий файл при сохранении.
+    Overwrite(PathBuf),
 }
 
 /// Открытое контекстное меню: где щёлкнули и что в нём (`None` — разделитель).
@@ -143,6 +145,9 @@ impl FilesWindow {
             }
             Some(Dialog::Confirm { action: ConfirmAction::Delete(paths), .. }) => {
                 self.run_job("Удаление", JobKind::NoUndo, cx, move |p, _| ops::delete_all(&paths, p));
+            }
+            Some(Dialog::Confirm { action: ConfirmAction::Overwrite(path), .. }) => {
+                self.pick_finish(conchy_portal_proto::response::OK, vec![path], cx);
             }
             Some(Dialog::Confirm { action: ConfirmAction::Erase(items), .. }) => {
                 self.run_job("Удаление из корзины", JobKind::NoUndo, cx, move |p, _| ops::erase_all(&items, p));

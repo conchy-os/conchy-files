@@ -1063,6 +1063,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "conchy-config",
+ "conchy-portal-proto",
  "futures",
  "gpui",
  "image",
@@ -1073,6 +1074,14 @@ dependencies = [
  "png 0.18.1",
  "rayon",
  "zbus",
+]
+
+[[package]]
+name = "conchy-portal-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "zvariant",
 ]
 
 [[package]]
