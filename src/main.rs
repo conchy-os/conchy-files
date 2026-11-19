@@ -134,7 +134,12 @@ fn main() {
                     let s = s.clone();
                     let _ = cx.update(|cx| match ev {
                         HostEvent::Pick { id, req, reply } => ui::open_picker(cx, id, *req, reply, &s),
-                        HostEvent::Cancel { id } => ui::cancel_pick(cx, &id),
+                        HostEvent::ChooseApp { id, req, reply } => ui::open_app_chooser(cx, id, *req, reply),
+                        HostEvent::UpdateChoices { id, choices } => ui::update_app_choices(cx, &id, choices),
+                        HostEvent::Cancel { id } => {
+                            ui::cancel_pick(cx, &id);
+                            ui::cancel_app_chooser(cx, &id);
+                        }
                     });
                 }
             })

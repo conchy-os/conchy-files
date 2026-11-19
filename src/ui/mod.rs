@@ -2,6 +2,7 @@
 //! и «Устройства», список файлов и строка состояния.
 
 mod actions;
+mod appchooser;
 mod devices;
 mod dialogs;
 mod dnd;
@@ -30,6 +31,7 @@ use gpui::{
     ScrollStrategy, Task, Timer, UniformListScrollHandle, Window, actions, div, prelude::*, px, rgb,
 };
 
+pub use appchooser::{cancel_app_chooser, open_app_chooser, update_app_choices};
 pub use picker::{cancel_pick, open_picker};
 
 use actions::{Clip, Job};

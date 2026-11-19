@@ -3,6 +3,7 @@
 //! Демон вызывает `Pick` (долгий pending-вызов: ответ приходит, когда пользователь закончил)
 //! и `Cancel`. Здесь только D-Bus; окна открывает GPUI-часть, получая [`HostEvent`] из канала.
 
+use conchy_portal_proto::apps::{AppChooseRequest, AppChooseResult};
 use conchy_portal_proto::files::{FilePickRequest, FilePickResult};
 use conchy_portal_proto::{FILES_HOST_BUS_NAME, HOST_OBJECT_PATH, response};
 use futures::channel::{mpsc, oneshot};
@@ -13,6 +14,10 @@ pub enum HostEvent {
     /// Показать пикер. Ответ (`response`, результат) надо отправить в `reply`; если
     /// отправитель сброшен без ответа, демон получит код 2.
     Pick { id: String, req: Box<FilePickRequest>, reply: oneshot::Sender<(u32, FilePickResult)> },
+    /// Показать выбор приложения («Открыть с помощью»).
+    ChooseApp { id: String, req: Box<AppChooseRequest>, reply: oneshot::Sender<(u32, AppChooseResult)> },
+    /// Обновить список в открытом выборе приложения.
+    UpdateChoices { id: String, choices: Vec<String> },
     /// Фронтенд закрыл запрос — закрыть окно и ответить кодом 1.
     Cancel { id: String },
 }
@@ -35,6 +40,18 @@ impl FilesHost {
             return (response::OTHER, FilePickResult::default());
         }
         rx.await.unwrap_or((response::OTHER, FilePickResult::default()))
+    }
+
+    async fn choose_app(&self, id: String, req: AppChooseRequest) -> (u32, AppChooseResult) {
+        let (reply, rx) = oneshot::channel();
+        if self.tx.unbounded_send(HostEvent::ChooseApp { id, req: Box::new(req), reply }).is_err() {
+            return (response::OTHER, AppChooseResult::default());
+        }
+        rx.await.unwrap_or((response::OTHER, AppChooseResult::default()))
+    }
+
+    async fn update_choices(&self, id: String, choices: Vec<String>) {
+        let _ = self.tx.unbounded_send(HostEvent::UpdateChoices { id, choices });
     }
 
     async fn cancel(&self, id: String) {

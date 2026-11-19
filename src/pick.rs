@@ -90,6 +90,31 @@ pub fn save_target(folder: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(folder.join(name))
 }
 
+/// Приложения для AppChooser: только из `choices` (id без `.desktop`), `last_choice` первым,
+/// остальные в порядке портала; затем фильтр по подстроке имени или id.
+pub fn chooser_apps<'a>(
+    all: &'a [crate::apps::App],
+    choices: &[String],
+    last_choice: &str,
+    filter: &str,
+) -> Vec<&'a crate::apps::App> {
+    let q = filter.to_lowercase();
+    let bare = |a: &crate::apps::App| a.id.strip_suffix(".desktop").unwrap_or(&a.id).to_string();
+    let mut out: Vec<&crate::apps::App> = choices
+        .iter()
+        .filter_map(|c| {
+            let c = c.strip_suffix(".desktop").unwrap_or(c);
+            all.iter().find(|a| bare(a) == c)
+        })
+        .collect();
+    if let Some(i) = out.iter().position(|a| bare(a) == last_choice.strip_suffix(".desktop").unwrap_or(last_choice)) {
+        let a = out.remove(i);
+        out.insert(0, a);
+    }
+    out.retain(|a| q.is_empty() || a.name.to_lowercase().contains(&q) || a.id.to_lowercase().contains(&q));
+    out
+}
+
 /// Свободное имя в папке для SaveFiles: `a.txt` занято → `a (1).txt`, `a (2).txt`…
 pub fn unique_name(folder: &Path, name: &str) -> String {
     let taken = |n: &str| std::fs::symlink_metadata(folder.join(n)).is_ok();
@@ -270,6 +295,26 @@ mod tests {
         std::fs::write(d.join(".rc"), "").unwrap();
         assert_eq!(unique_name(&d, ".rc"), ".rc (1)");
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn chooser_orders_and_filters() {
+        let app = |id: &str, name: &str| crate::apps::App {
+            id: id.into(),
+            name: name.into(),
+            exec: String::new(),
+            icon: String::new(),
+            terminal: false,
+            mime_types: vec![],
+            path: PathBuf::new(),
+        };
+        let all = vec![app("org.a.desktop", "Alpha"), app("org.b.desktop", "Beta"), app("org.c.desktop", "Gamma")];
+        let ch = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let names = |v: Vec<&crate::apps::App>| v.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(chooser_apps(&all, &ch(&["org.c", "org.a", "org.zzz"]), "", "")), ["Gamma", "Alpha"]);
+        assert_eq!(names(chooser_apps(&all, &ch(&["org.c", "org.a"]), "org.a", "")), ["Alpha", "Gamma"]);
+        assert_eq!(names(chooser_apps(&all, &ch(&["org.a", "org.b"]), "", "BET")), ["Beta"]);
+        assert!(chooser_apps(&all, &[], "", "").is_empty());
     }
 
     #[test]
